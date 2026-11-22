@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "mind_mapper"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "eframe",
