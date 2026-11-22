@@ -28,6 +28,10 @@ pub enum StartChoice {
     Open,
     /// Return to the map that was open before the start screen was shown.
     Back,
+    /// Reopen the work recovered from a crashed session.
+    Restore,
+    /// Throw the recovered work away.
+    DiscardRecovery,
 }
 
 /// Template gallery with pre-built thumbnail maps.
@@ -65,6 +69,8 @@ impl StartScreen {
     ///
     /// * `ui` - Area to fill
     /// * `can_return` - Whether a map is already open, enabling "Back" and Escape
+    /// * `recovery` - Description of work recovered from a crash, if any; shows a
+    ///   Restore/Discard banner
     /// * `theme` - Colour theme, changeable from the picker at the top
     ///
     /// # Returns
@@ -74,6 +80,7 @@ impl StartScreen {
         &mut self,
         ui: &mut Ui,
         can_return: bool,
+        recovery: Option<&str>,
         theme: &mut ColorTheme,
     ) -> Option<StartChoice> {
         let mut choice = None;
@@ -108,6 +115,10 @@ impl StartScreen {
                         choice = Some(StartChoice::Back);
                     }
                     ui.add_space(GAP);
+                    if let Some(description) = recovery {
+                        choice = recovery_banner(ui, description).or(choice);
+                        ui.add_space(GAP);
+                    }
                 });
                 if let Some(index) = self.gallery(ui) {
                     choice = Some(StartChoice::Template(index));
@@ -197,6 +208,31 @@ impl StartScreen {
         }
         response.on_hover_cursor(CursorIcon::PointingHand).clicked()
     }
+}
+
+/// A highlighted box offering to restore or discard work recovered after a crash.
+///
+/// # Returns
+///
+/// `Restore` or `DiscardRecovery` if one of its buttons was clicked.
+fn recovery_banner(ui: &mut Ui, description: &str) -> Option<StartChoice> {
+    let mut choice = None;
+    let accent = ui.visuals().selection.stroke.color;
+    egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(2.0, accent))
+        .inner_margin(GAP * 0.75)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Unsaved work was recovered from your last session").strong());
+            ui.label(description);
+            ui.add_space(GAP * 0.5);
+            if ui.button("Restore").clicked() {
+                choice = Some(StartChoice::Restore);
+            }
+            if ui.button("Discard").clicked() {
+                choice = Some(StartChoice::DiscardRecovery);
+            }
+        });
+    choice
 }
 
 /// Total width of `columns` cards with gaps between them.

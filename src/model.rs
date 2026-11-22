@@ -94,6 +94,9 @@ pub enum MapError {
         /// The parent index it pointed to.
         parent: usize,
     },
+    /// A node cannot be moved underneath itself or one of its own descendants.
+    #[error("a node cannot be moved into its own branch")]
+    WouldCreateCycle,
 }
 
 /// Flat, serializable form of a single node.
@@ -366,6 +369,83 @@ impl MindMap {
         Ok(())
     }
 
+    /// Whether `node` is `ancestor` itself or lies somewhere below it.
+    ///
+    /// Walks up from `node`, so the cost is the depth of `node`, not the subtree size.
+    #[must_use]
+    pub fn is_in_subtree(&self, node: NodeId, ancestor: NodeId) -> bool {
+        // `successors` repeatedly applies the closure: node, parent, grandparent, ...
+        std::iter::successors(Some(node), |&id| self.node(id).and_then(|n| n.parent))
+            .any(|id| id == ancestor)
+    }
+
+    /// Re-attach `id` (with its whole branch) as the last child of `new_parent`, and move
+    /// the branch to where a new child of `new_parent` would be placed.
+    ///
+    /// If the branch ends up on the other side of its parent (e.g. it moves from the left
+    /// half of the map to the right), its descendants are mirrored so they keep growing
+    /// outwards instead of overlapping the rest of the map.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Root of the branch to move
+    /// * `new_parent` - Node that will own the branch
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::NodeNotFound` if either node does not exist
+    /// * `MapError::RootNode` if `id` is the root
+    /// * `MapError::WouldCreateCycle` if `new_parent` is `id` or one of its descendants
+    pub fn move_subtree(&mut self, id: NodeId, new_parent: NodeId) -> Result<(), MapError> {
+        let old_parent = self
+            .node(id)
+            .ok_or(MapError::NodeNotFound(id))?
+            .parent
+            .ok_or(MapError::RootNode)?;
+        // Computed before re-attaching so the slot does not account for `id` itself.
+        let slot = self.next_child_position(new_parent)?;
+        if self.is_in_subtree(new_parent, id) {
+            return Err(MapError::WouldCreateCycle);
+        }
+
+        // Which way the branch grows is read from its own children, not from where the
+        // node sits now: a drag may already have carried it across to the other side.
+        let x_of = |map: &Self, node: NodeId| map.node(node).map_or(0.0, |n| n.position.x);
+        let node_x = x_of(self, id);
+        let grows_left = self
+            .node(id)
+            .and_then(|node| node.children.first())
+            .map(|&child| x_of(self, child) < node_x);
+        let goes_left = slot.x < x_of(self, new_parent);
+        if grows_left.is_some_and(|grows_left| grows_left != goes_left) {
+            self.mirror_descendants(id, node_x)?;
+        }
+
+        self.node_mut(old_parent)?
+            .children
+            .retain(|&child| child != id);
+        self.node_mut(new_parent)?.children.push(id);
+        let node = self.node_mut(id)?;
+        node.parent = Some(new_parent);
+        let (dx, dy) = (slot.x - node.position.x, slot.y - node.position.y);
+        self.translate_subtree(id, dx, dy)
+    }
+
+    /// Reflect every descendant of `id` horizontally across the vertical line `axis_x`.
+    fn mirror_descendants(&mut self, id: NodeId, axis_x: f32) -> Result<(), MapError> {
+        let mut stack = self
+            .node(id)
+            .ok_or(MapError::NodeNotFound(id))?
+            .children
+            .clone();
+        while let Some(current) = stack.pop() {
+            let node = self.node_mut(current)?;
+            node.position.x = 2.0 * axis_x - node.position.x;
+            stack.extend_from_slice(&node.children);
+        }
+        Ok(())
+    }
+
     /// Delete a node together with all of its descendants.
     ///
     /// # Returns
@@ -573,6 +653,101 @@ mod tests {
         let reused = map.add_child(b, "new").expect("b exists");
         assert!(reused == a || reused == a1);
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn is_in_subtree_follows_ancestry() {
+        let (map, a, b, a1) = sample_map();
+
+        assert!(map.is_in_subtree(a1, a));
+        assert!(map.is_in_subtree(a, a));
+        assert!(map.is_in_subtree(a1, map.root()));
+        assert!(!map.is_in_subtree(a1, b));
+        assert!(!map.is_in_subtree(a, a1));
+    }
+
+    #[test]
+    fn move_subtree_reattaches_and_relocates_branch() {
+        let (mut map, a, b, a1) = sample_map();
+        let grandchild_before = map.node(a1).expect("a1").position();
+        let a_before = map.node(a).expect("a").position();
+
+        map.move_subtree(a, b).expect("valid move");
+
+        assert_eq!(map.node(a).expect("a").parent(), Some(b));
+        assert_eq!(map.node(b).expect("b").children(), &[a]);
+        assert_eq!(map.node(map.root()).expect("root").children(), &[b]);
+        let b_pos = map.node(b).expect("b").position();
+        let a_after = map.node(a).expect("a").position();
+        assert_eq!(a_after, Point::new(b_pos.x + CHILD_OFFSET_X, b_pos.y));
+        // The descendant moved by the same offset as the branch root.
+        let grandchild_after = map.node(a1).expect("a1").position();
+        assert_eq!(
+            grandchild_after.x - grandchild_before.x,
+            a_after.x - a_before.x
+        );
+        assert_eq!(
+            grandchild_after.y - grandchild_before.y,
+            a_after.y - a_before.y
+        );
+    }
+
+    #[test]
+    fn branch_moved_to_other_side_is_mirrored() {
+        let (mut map, a, _, a1) = sample_map();
+        let left = map
+            .add_child_at(map.root(), "left", Point::new(-CHILD_OFFSET_X, 100.0))
+            .expect("root exists");
+
+        map.move_subtree(a, left).expect("valid move");
+
+        // `a` goes one step further left, and its child now grows leftwards too.
+        let a_pos = map.node(a).expect("a").position();
+        assert_eq!(a_pos, Point::new(-2.0 * CHILD_OFFSET_X, 100.0));
+        let child_pos = map.node(a1).expect("a1").position();
+        assert_eq!(child_pos, Point::new(-3.0 * CHILD_OFFSET_X, 100.0));
+    }
+
+    #[test]
+    fn branch_dragged_across_before_drop_is_still_mirrored() {
+        let (mut map, a, _, a1) = sample_map();
+        let left = map
+            .add_child_at(map.root(), "left", Point::new(-CHILD_OFFSET_X, 100.0))
+            .expect("root exists");
+        // The user drags `a` over to the left side before releasing it.
+        map.translate_subtree(a, -3.0 * CHILD_OFFSET_X, 100.0)
+            .expect("a exists");
+
+        map.move_subtree(a, left).expect("valid move");
+
+        let a_x = map.node(a).expect("a").position().x;
+        let child_x = map.node(a1).expect("a1").position().x;
+        assert_eq!(child_x, a_x - CHILD_OFFSET_X);
+    }
+
+    #[test]
+    fn move_subtree_rejects_invalid_moves() {
+        let (mut map, a, _, a1) = sample_map();
+        let before = map.clone();
+
+        assert_eq!(map.move_subtree(a, a1), Err(MapError::WouldCreateCycle));
+        assert_eq!(map.move_subtree(a, a), Err(MapError::WouldCreateCycle));
+        assert_eq!(map.move_subtree(map.root(), a), Err(MapError::RootNode));
+        assert_eq!(
+            map.move_subtree(a, NodeId(99)),
+            Err(MapError::NodeNotFound(NodeId(99)))
+        );
+        assert_eq!(map, before);
+    }
+
+    #[test]
+    fn moved_subtree_survives_save_round_trip() {
+        let (mut map, a, b, _) = sample_map();
+        map.move_subtree(a, b).expect("valid move");
+
+        let rebuilt = MindMap::from_records(map.to_records()).expect("records are valid");
+
+        assert_eq!(rebuilt.to_records(), map.to_records());
     }
 
     #[test]

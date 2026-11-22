@@ -1,6 +1,7 @@
 //! The egui application: start screen, toolbar, canvas and user interaction.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eframe::egui::{
     self, Align2, FontId, Key, KeyboardShortcut, Modifiers, PointerButton, Rect, Response, Sense,
@@ -11,10 +12,15 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 use crate::history::History;
 use crate::map_view::{BASE_FONT_SIZE, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
+use crate::recovery::{Recovered, RecoveryStore};
 use crate::start_screen::{StartChoice, StartScreen};
 use crate::storage;
 use crate::theme::{ColorTheme, theme_picker};
 
+/// Application name: window title, and the folder name for settings and recovery data.
+pub const APP_NAME: &str = "Mind Mapper";
+/// Minimum time between background copies of unsaved work.
+const AUTOSAVE_SECONDS: f64 = 20.0;
 /// Narrowest text box shown while editing, at 100% zoom.
 const MIN_EDITOR_WIDTH: f32 = 140.0;
 /// Number of undo steps kept.
@@ -117,7 +123,12 @@ struct EditSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drag {
     /// Moving a node and its descendants.
-    Node(NodeId),
+    Node {
+        /// The node being dragged.
+        id: NodeId,
+        /// Node under the cursor that the branch would be re-attached to if dropped now.
+        drop_target: Option<NodeId>,
+    },
     /// Moving the view.
     Pan,
 }
@@ -141,11 +152,24 @@ pub struct MindMapApp {
     needs_fit: bool,
     window_title: String,
     status: String,
+    /// Where unsaved work is copied for crash recovery; `None` if there is no data folder.
+    recovery: Option<RecoveryStore>,
+    /// Work recovered from a crashed session, waiting for Restore or Discard.
+    recovered: Option<Recovered>,
+    /// A command-line file held back until the recovered work has been dealt with.
+    deferred_open: Option<PathBuf>,
+    /// The map changed since the last recovery copy was written.
+    autosave_pending: bool,
+    /// When the last recovery copy was written, in seconds since the app started.
+    last_autosave: f64,
 }
 
 impl MindMapApp {
     /// Create the app on the start screen, or straight in the editor if `initial_path`
     /// opens successfully.
+    ///
+    /// If unsaved work survived a crash, the start screen offers it first and
+    /// `initial_path` is opened only after that work is discarded.
     ///
     /// # Arguments
     ///
@@ -156,8 +180,19 @@ impl MindMapApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<&Path>) -> Self {
         let mut app = Self::with_map(MindMap::new(DEFAULT_ROOT_TEXT));
         app.theme = ColorTheme::load(cc.storage);
+        app.recovery = eframe::storage_dir(APP_NAME).map(|dir| RecoveryStore::in_dir(&dir));
+        if let Some(store) = &app.recovery {
+            match store.load() {
+                Ok(found) => app.recovered = found,
+                Err(err) => app.status = format!("Could not read recovered work: {err}"),
+            }
+        }
         if let Some(path) = initial_path {
-            app.open_path(path);
+            if app.recovered.is_some() {
+                app.deferred_open = Some(path.to_owned());
+            } else {
+                app.open_path(path);
+            }
         }
         app
     }
@@ -179,6 +214,48 @@ impl MindMapApp {
             needs_fit: true,
             window_title: String::new(),
             status: String::new(),
+            recovery: None,
+            recovered: None,
+            deferred_open: None,
+            autosave_pending: false,
+            last_autosave: 0.0,
+        }
+    }
+
+    /// Note that the map has unsaved changes (and needs a fresh recovery copy).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.autosave_pending = true;
+    }
+
+    /// Write a recovery copy if there are new changes and enough time has passed.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        if !self.autosave_pending {
+            return;
+        }
+        let Some(store) = &self.recovery else {
+            return;
+        };
+        let now = ctx.input(|input| input.time);
+        let due = self.last_autosave + AUTOSAVE_SECONDS;
+        if now < due {
+            // egui only redraws on input, so ask for a wake-up when the save is due.
+            ctx.request_repaint_after(Duration::from_secs_f64(due - now));
+            return;
+        }
+        if let Err(err) = store.save(&self.map, self.file_path.as_deref()) {
+            self.status = format!("Auto-save failed: {err}");
+        }
+        self.last_autosave = now;
+        self.autosave_pending = false;
+    }
+
+    /// Delete the recovery copy (after a save, or once the user discards their work).
+    fn clear_recovery(&mut self) {
+        if let Some(store) = &self.recovery
+            && let Err(err) = store.clear()
+        {
+            self.status = format!("Could not remove the recovery file: {err}");
         }
     }
 
@@ -191,7 +268,7 @@ impl MindMapApp {
         match change(&mut self.map) {
             Ok(value) => {
                 self.history.record(snapshot);
-                self.dirty = true;
+                self.mark_dirty();
                 Some(value)
             }
             Err(err) => {
@@ -272,7 +349,7 @@ impl MindMapApp {
         let map = &self.map;
         self.selected = self.selected.filter(|&id| map.node(id).is_some());
         self.editing = None;
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
@@ -299,6 +376,22 @@ impl MindMapApp {
             }
             StartChoice::Open => self.perform(Action::Open),
             StartChoice::Back => self.screen = Screen::Editor,
+            StartChoice::Restore => {
+                if let Some(Recovered { map, source }) = self.recovered.take() {
+                    self.deferred_open = None;
+                    self.replace_map(map, source);
+                    // Still unsaved; this also keeps the recovery copy up to date.
+                    self.mark_dirty();
+                    "Restored unsaved work from the last session".clone_into(&mut self.status);
+                }
+            }
+            StartChoice::DiscardRecovery => {
+                self.recovered = None;
+                self.clear_recovery();
+                if let Some(path) = self.deferred_open.take() {
+                    self.open_path(&path);
+                }
+            }
         }
     }
 
@@ -317,21 +410,39 @@ impl MindMapApp {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.dirty = false;
+                self.autosave_pending = false;
+                self.clear_recovery();
             }
             Err(err) => self.status = format!("Could not save {}: {err}", path.display()),
         }
         self.file_path = Some(path);
     }
 
-    /// Ask before throwing away unsaved changes.
-    fn confirm_discard(&self) -> bool {
-        !self.dirty
-            || MessageDialog::new()
-                .set_title("Unsaved changes")
-                .set_description("Discard the unsaved changes to this mind map?")
-                .set_buttons(MessageButtons::YesNo)
-                .show()
-                == MessageDialogResult::Yes
+    /// Ask before throwing away unsaved (or recovered) work. If the user agrees, the
+    /// recovery copy is deleted too.
+    ///
+    /// # Returns
+    ///
+    /// `true` if it is fine to continue.
+    fn confirm_discard(&mut self) -> bool {
+        let has_unsaved = self.dirty || self.recovered.is_some();
+        if !has_unsaved {
+            return true;
+        }
+        let discard = MessageDialog::new()
+            .set_title("Unsaved changes")
+            .set_description("Discard the unsaved changes to this mind map?")
+            .set_buttons(MessageButtons::YesNo)
+            .show()
+            == MessageDialogResult::Yes;
+        if discard {
+            self.recovered = None;
+            self.clear_recovery();
+            // If the current map stays open (e.g. the file dialog is cancelled), keep
+            // protecting it.
+            self.autosave_pending = self.dirty;
+        }
+        discard
     }
 
     fn start_edit(&mut self, id: NodeId, buffer: String) {
@@ -359,16 +470,16 @@ impl MindMapApp {
     }
 
     fn title(&self) -> String {
+        if matches!(self.screen, Screen::Start { .. }) {
+            return APP_NAME.to_owned();
+        }
         let name = self
             .file_path
             .as_deref()
             .and_then(Path::file_name)
             .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
-        if matches!(self.screen, Screen::Start { .. }) {
-            return "Mind Mapper".to_owned();
-        }
         let marker = if self.dirty { "*" } else { "" };
-        format!("{marker}{name} - Mind Mapper")
+        format!("{marker}{name} - {APP_NAME}")
     }
 
     fn toolbar(&mut self, ui: &mut Ui) -> Option<Action> {
@@ -443,9 +554,13 @@ impl MindMapApp {
                 .and_then(|origin| self.view.hit_test(origin));
             self.drag = Some(match target {
                 Some(id) => {
+                    // One undo step covers both the move and any re-attachment on drop.
                     self.history.record(self.map.clone());
                     self.selected = Some(id);
-                    Drag::Node(id)
+                    Drag::Node {
+                        id,
+                        drop_target: None,
+                    }
                 }
                 None => Drag::Pan,
             });
@@ -453,21 +568,32 @@ impl MindMapApp {
         if response.dragged() {
             let delta = response.drag_delta();
             match self.drag {
-                Some(Drag::Node(id)) => {
+                Some(Drag::Node { id, .. }) => {
                     let world_delta = delta / self.view.camera().zoom();
                     if self
                         .map
                         .translate_subtree(id, world_delta.x, world_delta.y)
                         .is_ok()
                     {
-                        self.dirty = true;
+                        self.mark_dirty();
                     }
+                    let drop_target = response
+                        .interact_pointer_pos()
+                        .and_then(|pos| self.find_drop_target(id, pos));
+                    self.drag = Some(Drag::Node { id, drop_target });
                 }
                 Some(Drag::Pan) => self.view.camera_mut().pan(delta),
                 None => {}
             }
         }
         if response.drag_stopped() {
+            if let Some(Drag::Node {
+                id,
+                drop_target: Some(new_parent),
+            }) = self.drag
+            {
+                self.reparent(id, new_parent);
+            }
             self.drag = None;
         }
 
@@ -479,6 +605,23 @@ impl MindMapApp {
         } else if response.clicked() {
             self.commit_edit();
             self.selected = hit;
+        }
+    }
+
+    /// The node under `screen` that `dragged` could be dropped onto: anything except the
+    /// dragged branch itself and its current parent (dropping there would change nothing).
+    fn find_drop_target(&self, dragged: NodeId, screen: egui::Pos2) -> Option<NodeId> {
+        let current_parent = self.map.node(dragged).and_then(Node::parent);
+        self.view.hit_test_where(screen, |candidate| {
+            Some(candidate) != current_parent && !self.map.is_in_subtree(candidate, dragged)
+        })
+    }
+
+    /// Re-attach `id` under `new_parent`. The undo point was recorded when the drag began.
+    fn reparent(&mut self, id: NodeId, new_parent: NodeId) {
+        match self.map.move_subtree(id, new_parent) {
+            Ok(()) => self.mark_dirty(),
+            Err(err) => self.status = err.to_string(),
         }
     }
 
@@ -534,6 +677,14 @@ impl MindMapApp {
         self.handle_pointer(ui, &response);
         self.view
             .paint(&painter, ui.visuals(), &self.map, self.selected);
+        if let Some(Drag::Node {
+            drop_target: Some(target),
+            ..
+        }) = self.drag
+        {
+            self.view
+                .outline(&painter, target, ui.visuals().selection.stroke.color);
+        }
         self.show_editor(ui);
     }
 
@@ -598,10 +749,15 @@ impl eframe::App for MindMapApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_window(ui);
+        self.autosave(ui.ctx());
         self.handle_shortcuts(ui);
         if let Screen::Start { can_return } = self.screen {
+            let recovery_label = self.recovered.as_ref().map(Recovered::description);
             let choice = egui::CentralPanel::default()
-                .show(ui, |ui| self.start.show(ui, can_return, &mut self.theme))
+                .show(ui, |ui| {
+                    self.start
+                        .show(ui, can_return, recovery_label.as_deref(), &mut self.theme)
+                })
                 .inner;
             if let Some(choice) = choice {
                 self.choose(choice);
@@ -621,6 +777,7 @@ impl eframe::App for MindMapApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn app_with_child() -> (MindMapApp, NodeId) {
         let mut app = MindMapApp::with_map(MindMap::new("root"));
@@ -690,6 +847,34 @@ mod tests {
     }
 
     #[test]
+    fn reparent_moves_branch_and_undo_restores_it() {
+        let (mut app, child) = app_with_child();
+        let root = app.map.root();
+        let other = app
+            .edit_map(|map| map.add_child(root, "other"))
+            .expect("root exists");
+        // Dragging records the undo point before anything moves.
+        app.history.record(app.map.clone());
+
+        app.reparent(child, other);
+
+        assert_eq!(app.map.node(child).expect("child").parent(), Some(other));
+        app.perform(Action::Undo);
+        assert_eq!(app.map.node(child).expect("child").parent(), Some(root));
+    }
+
+    #[test]
+    fn invalid_reparent_reports_error() {
+        let (mut app, child) = app_with_child();
+        let root = app.map.root();
+
+        app.reparent(root, child);
+
+        assert_eq!(app.map.node(root).expect("root").parent(), None);
+        assert_eq!(app.status, MapError::RootNode.to_string());
+    }
+
+    #[test]
     fn root_cannot_be_deleted() {
         let mut app = MindMapApp::with_map(MindMap::new("root"));
         app.selected = Some(app.map.root());
@@ -745,6 +930,85 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Editor);
         assert!(app.map.node(child).is_some());
+    }
+
+    #[test]
+    fn restore_opens_recovered_map_as_unsaved() {
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+        let mut map = MindMap::new("recovered");
+        map.add_child(map.root(), "idea").expect("root exists");
+        app.recovered = Some(Recovered {
+            map: map.clone(),
+            source: Some(PathBuf::from("ideas.json")),
+        });
+        app.deferred_open = Some(PathBuf::from("other.json"));
+
+        app.choose(StartChoice::Restore);
+
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.map, map);
+        assert_eq!(app.file_path, Some(PathBuf::from("ideas.json")));
+        assert!(app.dirty);
+        assert!(app.autosave_pending);
+        assert!(app.recovered.is_none());
+        assert!(app.deferred_open.is_none());
+    }
+
+    #[test]
+    fn discard_recovery_deletes_copy_and_opens_deferred_file() {
+        let dir = TempDir::new("app_discard");
+        let store = RecoveryStore::in_dir(dir.path());
+        let recovered = MindMap::new("recovered");
+        store.save(&recovered, None).expect("save succeeds");
+        let deferred = dir.path().join("deferred.json");
+        storage::save_to_path(&MindMap::new("deferred"), &deferred).expect("save succeeds");
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+        app.recovery = Some(store.clone());
+        app.recovered = Some(Recovered {
+            map: recovered,
+            source: None,
+        });
+        app.deferred_open = Some(deferred.clone());
+
+        app.choose(StartChoice::DiscardRecovery);
+
+        assert_eq!(store.load().expect("load succeeds"), None);
+        assert!(app.recovered.is_none());
+        assert_eq!(app.file_path, Some(deferred));
+        assert_eq!(app.screen, Screen::Editor);
+    }
+
+    #[test]
+    fn autosave_waits_for_interval_then_writes_recovery_copy() {
+        let dir = TempDir::new("app_autosave");
+        let store = RecoveryStore::in_dir(dir.path());
+        let ctx = egui::Context::default();
+        let (mut app, _) = app_with_child();
+        app.recovery = Some(store.clone());
+        // The app has just started (time 0), so the first interval has not elapsed.
+        app.autosave(&ctx);
+        assert_eq!(store.load().expect("load succeeds"), None);
+
+        app.last_autosave = -AUTOSAVE_SECONDS;
+        app.autosave(&ctx);
+
+        let saved = store.load().expect("load succeeds").expect("copy written");
+        assert_eq!(saved.map, app.map);
+        assert!(!app.autosave_pending);
+    }
+
+    #[test]
+    fn saving_removes_recovery_copy() {
+        let dir = TempDir::new("app_save_clears");
+        let store = RecoveryStore::in_dir(dir.path());
+        let (mut app, _) = app_with_child();
+        app.recovery = Some(store.clone());
+        store.save(&app.map, None).expect("save succeeds");
+
+        app.save_to(dir.path().join("map.json"));
+
+        assert!(!app.dirty);
+        assert_eq!(store.load().expect("load succeeds"), None);
     }
 
     #[test]

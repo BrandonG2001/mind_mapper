@@ -15,14 +15,18 @@ keyboard, drag branches around and save your maps as plain JSON files.
   preview of its map.
 - **Keyboard-first editing**: Tab adds a child, Enter adds a sibling, and you type the
   label straight away.
-- **Drag to rearrange**: moving a node moves all of its descendants with it.
+- **Drag to rearrange**: moving a node moves all of its descendants with it. Drop it onto
+  another node to move the whole branch under that node.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
   dragging the background.
 - **Undo/redo**: up to 200 steps.
 - **Seven colour themes**: Dark, Light, Light grey, Dark grey, Dark blue, Light purple and
   Dark purple. Your choice is remembered between runs.
 - **Plain JSON files** that are easy to back up, diff or generate with other tools.
-- **Single portable executable** on Windows. No installer or runtime needed.
+- **Safe saving and crash recovery**: saves never leave a half-written file, and unsaved
+  work is backed up in the background so it can be restored after a crash.
+- **Portable builds** for Windows (x86-64) and Linux (x86-64 and ARM64). No installer or
+  runtime needed.
 
 ## Getting started
 
@@ -39,7 +43,13 @@ keyboard, drag branches around and save your maps as plain JSON files.
 
   File dialogs use the XDG desktop portal, which most desktop environments provide.
 
-### Build and run
+### Download
+
+Tagged versions are published on the repository's **Releases** page as ready-to-run
+archives for Windows x86-64, Linux x86-64 and Linux ARM64. Unpack one and run
+`mind_mapper` (or `mind_mapper.exe`).
+
+### Build from source
 
 ```sh
 git clone https://github.com/BrandonG2001/mind_mapper.git
@@ -65,6 +75,7 @@ mind_mapper path/to/ideas.json
 | Select a node | Click it |
 | Rename a node | Double-click it |
 | Move a node and its branch | Drag it |
+| Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
 
@@ -88,6 +99,13 @@ returns to the map you were editing.
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
 work is discarded by opening another map, choosing a template or closing the window.
 
+### Crash recovery
+
+While a map has unsaved changes, a copy is written in the background at most every 20
+seconds. If Mind Mapper closes unexpectedly, the next launch shows a banner on the start
+screen where you can **Restore** that work or **Discard** it. The copy is deleted when you
+save, or when you choose to discard your changes.
+
 ## File format
 
 Maps are saved as JSON. Nodes are listed parents-first, and each node refers to its
@@ -107,9 +125,15 @@ parent by its position in the list:
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
 
-The theme and window size are kept separately, in eframe's settings file
-(`%APPDATA%\Mind Mapper\data\app.ron` on Windows, or your user data directory on
-Linux).
+Saving writes to a temporary file first and then swaps it into place, so a crash or full
+disk mid-save leaves the previous version intact.
+
+Settings (theme and window size) and the crash-recovery copy live in the app's data folder:
+
+| OS | Folder |
+|---|---|
+| Windows | `%APPDATA%\Mind Mapper\data\` |
+| Linux | `~/.local/share/mindmapper/` (or `$XDG_DATA_HOME/mindmapper/`) |
 
 ## Development
 
@@ -119,6 +143,15 @@ cargo clippy --all-targets -- -D warnings   # lint
 cargo fmt --check                           # check formatting
 ```
 
+GitHub Actions runs formatting, clippy and the tests on Windows and Linux for every push
+and pull request, and cross-compiles the Linux ARM64 build. Pushing a tag such as `v0.2.0`
+builds the portable archives and publishes them as a GitHub Release:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
 ### Project layout
 
 | File | Purpose |
@@ -126,7 +159,8 @@ cargo fmt --check                           # check formatting
 | [`src/model.rs`](src/model.rs) | The mind-map tree and its editing operations |
 | [`src/history.rs`](src/history.rs) | Undo/redo |
 | [`src/camera.rs`](src/camera.rs) | Pan and zoom transform |
-| [`src/storage.rs`](src/storage.rs) | JSON load and save |
+| [`src/storage.rs`](src/storage.rs) | JSON load and save, atomic file writes |
+| [`src/recovery.rs`](src/recovery.rs) | Background copy of unsaved work for crash recovery |
 | [`src/templates.rs`](src/templates.rs) | Built-in templates and their automatic layout |
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |
 | [`src/start_screen.rs`](src/start_screen.rs) | The template gallery |

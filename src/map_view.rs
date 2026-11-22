@@ -159,12 +159,42 @@ impl MapView {
     /// The topmost node drawn at `screen` in the last [`MapView::paint`] call.
     #[must_use]
     pub fn hit_test(&self, screen: Pos2) -> Option<NodeId> {
+        self.hit_test_where(screen, |_| true)
+    }
+
+    /// Like [`MapView::hit_test`], but only considers nodes for which `accept` is true.
+    ///
+    /// # Arguments
+    ///
+    /// * `screen` - Point to test, in screen pixels
+    /// * `accept` - Filter, e.g. to ignore the node currently being dragged
+    #[must_use]
+    pub fn hit_test_where(&self, screen: Pos2, accept: impl Fn(NodeId) -> bool) -> Option<NodeId> {
         // Reverse order: nodes painted last are on top.
         self.layout
             .iter()
             .rev()
-            .find(|node| node.rect.contains(screen))
+            .find(|node| node.rect.contains(screen) && accept(node.id))
             .map(|node| node.id)
+    }
+
+    /// Draw a highlight ring around `id` if it was drawn in the last paint call.
+    ///
+    /// # Arguments
+    ///
+    /// * `painter` - Where to draw
+    /// * `id` - Node to outline
+    /// * `color` - Ring colour
+    pub fn outline(&self, painter: &Painter, id: NodeId, color: Color32) {
+        if let Some(rect) = self.node_rect(id) {
+            let zoom = self.camera.zoom();
+            painter.rect_stroke(
+                rect.expand(3.0 * zoom),
+                CORNER_RADIUS * zoom * 1.4,
+                Stroke::new((3.0 * zoom).max(1.5), color),
+                StrokeKind::Outside,
+            );
+        }
     }
 
     /// Where `id` was drawn in the last [`MapView::paint`] call, or `None` if it was not
@@ -260,6 +290,11 @@ mod tests {
 
         // The child is drawn after (on top of) the root where they overlap.
         assert_eq!(view.hit_test(Pos2::new(205.0, 205.0)), Some(child));
+        // Filtering the child out exposes the root underneath.
+        assert_eq!(
+            view.hit_test_where(Pos2::new(205.0, 205.0), |id| id != child),
+            Some(map.root())
+        );
     }
 
     #[test]
