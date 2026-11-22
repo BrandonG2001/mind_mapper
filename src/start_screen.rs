@@ -108,7 +108,6 @@ impl StartScreen {
                 // Right-to-left layout pins the theme picker to the top-right corner.
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     theme_picker(ui, theme);
-                    ui.label("Theme");
                     // Plain spacing: a separator here would stretch to the full height.
                     ui.add_space(GAP);
                     ui_size_control(ui);
@@ -181,6 +180,12 @@ impl StartScreen {
     /// `true` if it was clicked.
     fn card(&mut self, ui: &mut Ui, index: usize) -> bool {
         let (rect, response) = ui.allocate_exact_size(CARD_SIZE, Sense::click());
+        // The card is painted by hand, so give it a name for screen readers (and UI tests).
+        if let Some(template) = TEMPLATES.get(index) {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, template.name)
+            });
+        }
         // Skip drawing cards scrolled out of view.
         if ui.is_rect_visible(rect)
             && let (Some(template), Some(map)) = (TEMPLATES.get(index), self.maps.get(index))

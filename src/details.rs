@@ -73,7 +73,16 @@ pub fn color_palette(ui: &mut Ui, current: Option<NodeColor>) -> Option<Option<N
             if current == Some(color) {
                 swatch = swatch.stroke(egui::Stroke::new(2.0, ui.visuals().strong_text_color()));
             }
-            if ui.add(swatch).clicked() {
+            let response = ui.add(swatch);
+            // A swatch has no text, so name it by its colour for screen readers.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::accesskit::Role::Button,
+                    true,
+                    format!("Colour {}", String::from(color)),
+                )
+            });
+            if response.clicked() {
                 picked = Some(Some(color));
             }
         }

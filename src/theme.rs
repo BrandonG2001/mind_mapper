@@ -256,20 +256,34 @@ pub fn ui_size_control(ui: &mut Ui) {
     }
 }
 
-/// A drop-down for choosing the colour theme.
+/// "Theme" and a drop-down for choosing the colour theme. The label is linked to the
+/// drop-down so screen readers announce it, and reads correctly in both left-to-right and
+/// right-to-left layouts.
 ///
 /// # Arguments
 ///
 /// * `ui` - Where to draw the drop-down
 /// * `theme` - Current theme; updated in place when the user picks another
 pub fn theme_picker(ui: &mut Ui, theme: &mut ColorTheme) {
-    egui::ComboBox::from_id_salt("color_theme")
-        .selected_text(theme.name())
-        .show_ui(ui, |ui| {
-            for option in ColorTheme::ALL {
-                ui.selectable_value(theme, option, option.name());
-            }
-        });
+    let mut combo = |ui: &mut Ui| {
+        egui::ComboBox::from_id_salt("color_theme")
+            .selected_text(theme.name())
+            .show_ui(ui, |ui| {
+                for option in ColorTheme::ALL {
+                    ui.selectable_value(theme, option, option.name());
+                }
+            })
+            .response
+    };
+    // A right-to-left layout places each widget left of the previous one.
+    if ui.layout().prefer_right_to_left() {
+        let picker = combo(ui);
+        let label = ui.label("Theme");
+        picker.labelled_by(label.id);
+    } else {
+        let label = ui.label("Theme");
+        combo(ui).labelled_by(label.id);
+    }
 }
 
 #[cfg(test)]

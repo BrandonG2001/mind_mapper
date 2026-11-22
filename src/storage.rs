@@ -5,7 +5,8 @@
 //! mid-save can never leave a half-written file behind.
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::hash::{DefaultHasher, Hasher};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -69,13 +70,53 @@ pub fn read_map<R: Read>(reader: R) -> Result<MindMap, StorageError> {
     Ok(MindMap::from_records(file.nodes)?)
 }
 
+/// A fingerprint of a file's exact contents, used to notice when another window or
+/// program has changed a map since it was opened or saved here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileStamp(u64);
+
+impl FileStamp {
+    fn of(bytes: &[u8]) -> Self {
+        // `DefaultHasher::new()` always starts from the same keys, so equal contents give
+        // equal stamps for the whole run of the program (stamps are never stored).
+        let mut hasher = DefaultHasher::new();
+        hasher.write(bytes);
+        Self(hasher.finish())
+    }
+}
+
 /// Save `map` to `path`, replacing any existing file atomically.
+///
+/// # Returns
+///
+/// The stamp of what was written.
 ///
 /// # Errors
 ///
 /// See [`write_map`] and [`write_atomically`].
-pub fn save_to_path(map: &MindMap, path: &Path) -> Result<(), StorageError> {
-    write_atomically(path, |writer| write_map(map, writer))
+pub fn save_to_path(map: &MindMap, path: &Path) -> Result<FileStamp, StorageError> {
+    // Serialise to memory first: the same bytes are written and fingerprinted.
+    let mut bytes = Vec::new();
+    write_map(map, &mut bytes)?;
+    write_atomically(path, |writer| Ok(writer.write_all(&bytes)?))?;
+    Ok(FileStamp::of(&bytes))
+}
+
+/// The stamp of the file at `path` as it is now.
+///
+/// # Returns
+///
+/// `Ok(None)` if there is no such file.
+///
+/// # Errors
+///
+/// Returns `StorageError::Io` if the file exists but cannot be read.
+pub fn current_stamp(path: &Path) -> Result<Option<FileStamp>, StorageError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(FileStamp::of(&bytes))),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Replace the file at `path` with whatever `write` produces, all or nothing.
@@ -129,11 +170,16 @@ fn temp_path(path: &Path) -> PathBuf {
 
 /// Load a map from `path`.
 ///
+/// # Returns
+///
+/// The map, and the stamp of the file it was read from.
+///
 /// # Errors
 ///
 /// See [`read_map`]; also fails if the file cannot be opened.
-pub fn load_from_path(path: &Path) -> Result<MindMap, StorageError> {
-    read_map(BufReader::new(File::open(path)?))
+pub fn load_from_path(path: &Path) -> Result<(MindMap, FileStamp), StorageError> {
+    let bytes = fs::read(path)?;
+    Ok((read_map(bytes.as_slice())?, FileStamp::of(&bytes)))
 }
 
 #[cfg(test)]
@@ -148,10 +194,11 @@ mod tests {
         fs::write(&path, "old contents").expect("temp dir is writable");
         let map = MindMap::new("fresh");
 
-        save_to_path(&map, &path).expect("save succeeds");
+        let saved = save_to_path(&map, &path).expect("save succeeds");
 
-        let loaded = load_from_path(&path).expect("saved file loads");
+        let (loaded, loaded_stamp) = load_from_path(&path).expect("saved file loads");
         assert_eq!(loaded.to_records(), map.to_records());
+        assert_eq!(saved, loaded_stamp);
         assert!(!temp_path(&path).exists());
     }
 
@@ -169,6 +216,25 @@ mod tests {
         assert!(matches!(result, Err(StorageError::UnsupportedVersion(0))));
         assert_eq!(fs::read_to_string(&path).expect("file exists"), "original");
         assert!(!temp_path(&path).exists());
+    }
+
+    #[test]
+    fn stamps_notice_any_change_on_disk() {
+        let dir = TempDir::new("stamps");
+        let path = dir.path().join("map.json");
+        assert_eq!(current_stamp(&path).expect("readable"), None);
+        let saved = save_to_path(&MindMap::new("root"), &path).expect("save succeeds");
+        assert_eq!(current_stamp(&path).expect("readable"), Some(saved));
+
+        // Another program changes the file.
+        let mut other = MindMap::new("root");
+        other
+            .add_child(other.root(), "added elsewhere")
+            .expect("root");
+        let changed = save_to_path(&other, &path).expect("save succeeds");
+
+        assert_ne!(changed, saved);
+        assert_eq!(current_stamp(&path).expect("readable"), Some(changed));
     }
 
     #[test]

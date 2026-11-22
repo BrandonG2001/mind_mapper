@@ -125,7 +125,9 @@ While renaming, Enter keeps the new label, Shift+Enter starts a new line and Esc
 On the template gallery, Esc returns to the map you were editing.
 
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
-work is discarded by opening another map, choosing a template or closing the window.
+work is discarded by opening another map, choosing a template or closing the window. If
+another window or program changed the file since you opened it, saving asks before
+replacing those changes.
 
 ### Crash recovery
 
@@ -181,6 +183,11 @@ cargo clippy --all-targets -- -D warnings   # lint
 cargo fmt --check                           # check formatting
 ```
 
+`cargo test` includes end-to-end UI tests ([`src/app/ui_tests.rs`](src/app/ui_tests.rs))
+that drive the real app with simulated mouse and keyboard input through
+[egui_kittest](https://crates.io/crates/egui_kittest), with no window or GPU needed. They
+also fail if any widget lacks an accessible name for screen readers.
+
 GitHub Actions runs formatting, clippy and the tests on Windows and Linux for every push
 and pull request, cross-compiles the Linux ARM64 build, and checks that every dependency's
 license is one accepted in [`about.toml`](about.toml). Pushing a tag such as `v0.2.0`
@@ -223,7 +230,12 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |
 | [`src/start_screen.rs`](src/start_screen.rs) | The template gallery |
 | [`src/theme.rs`](src/theme.rs) | Colour themes and saving the chosen one |
-| [`src/app.rs`](src/app.rs) | The application window, toolbar and input handling |
+| [`src/app.rs`](src/app.rs) | App state, actions and keyboard shortcuts |
+| [`src/app/canvas.rs`](src/app/canvas.rs) | Map canvas: mouse, inline label editor, right-click menu |
+| [`src/app/editing.rs`](src/app/editing.rs) | Undoable edits, folding, navigation, clipboard |
+| [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
+| [`src/app/files.rs`](src/app/files.rs) | Open, save (with the overwrite check), export, settings |
+| [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |
 
 ### Changing the icon
 

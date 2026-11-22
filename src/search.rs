@@ -148,6 +148,18 @@ impl Search {
             if field.changed() {
                 command = Some(SearchCommand::QueryChanged);
             }
+            // F3 / Shift+F3 step through matches while typing, as they do elsewhere (other
+            // shortcuts are paused while a text field has focus).
+            if field.has_focus()
+                && let Some(shift) =
+                    ui.input(|input| input.key_pressed(Key::F3).then_some(input.modifiers.shift))
+            {
+                command = Some(if shift {
+                    SearchCommand::Previous
+                } else {
+                    SearchCommand::Next
+                });
+            }
             // A single-line text field gives up focus when Enter or Escape is pressed.
             if field.lost_focus() {
                 let (enter, escape, shift) = ui.input(|input| {
