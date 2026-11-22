@@ -38,12 +38,13 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-      # Start the release build on a virtual screen (software OpenGL) and check it is
-      # still running after 15 seconds instead of crashing at startup.
+      # Start the release build on a virtual screen and check it is still running after 15
+      # seconds instead of crashing at startup. The runners have no GPU, so Mesa's
+      # software Vulkan (lavapipe) and EGL drivers give wgpu something to draw with.
       - name: Smoke test the release build
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y xvfb libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
+          sudo apt-get install -y xvfb mesa-vulkan-drivers libegl1 libegl-mesa0             libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
           cargo build --release --locked
           status=0
           timeout 15 xvfb-run -a target/release/mind_mapper || status=$?
