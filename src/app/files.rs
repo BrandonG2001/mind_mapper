@@ -23,6 +23,7 @@ impl MindMapApp {
                 recent: std::mem::take(&mut self.recent),
                 check_updates: self.updates.enabled,
                 last_update_check: None,
+                auto_save: self.file_autosave.enabled,
             };
             change(&mut settings);
             self.recent = settings.recent;

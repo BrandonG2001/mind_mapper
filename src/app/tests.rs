@@ -1113,3 +1113,75 @@ fn pictures_are_pasted_or_dropped_onto_nodes() {
     app.remove_picture(b);
     assert!(app.map.node(b).and_then(Node::picture).is_none());
 }
+
+#[test]
+fn replace_changes_one_match_at_a_time_or_all_in_one_step() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    app.map.set_text(a, "Plan A").expect("a");
+    app.map.set_text(b, "plan b").expect("b");
+    app.map.set_note(c, "the PLAN").expect("c");
+    let text = |app: &MindMapApp, id| app.map.node(id).expect("live").text().to_owned();
+
+    app.perform(Action::Replace);
+    let search = app.search.as_mut().expect("find bar open");
+    search.set_query("plan");
+    search.set_replacement("Route");
+    app.search_command(SearchCommand::QueryChanged);
+    assert_eq!(app.selected, Some(a));
+
+    app.search_command(SearchCommand::Replace);
+    assert_eq!(text(&app, a), "Route A");
+    assert_eq!(app.status, "Replaced 1 occurrence");
+    assert_eq!(app.selected, Some(b), "moved on to the next match");
+
+    app.search_command(SearchCommand::ReplaceAll);
+    assert_eq!(text(&app, b), "Route b");
+    assert_eq!(app.map.node(c).expect("live").note(), "the Route");
+    assert_eq!(app.status, "Replaced 2 occurrences");
+    app.perform(Action::Undo);
+    assert_eq!(
+        (text(&app, a), text(&app, b)),
+        ("Route A".to_owned(), "plan b".to_owned())
+    );
+}
+
+#[test]
+fn auto_save_waits_for_a_pause_and_never_overwrites_changes_made_elsewhere() {
+    let dir = TempDir::new("app_auto_save");
+    let path = dir.path().join("auto.json");
+    storage::save_to_path(&MindMap::new("auto"), &path).expect("save succeeds");
+    let mut app = MindMapApp::with_map(MindMap::new("root"));
+    app.open_path(&path);
+    let root = app.map.root();
+    let on_disk = |path: &std::path::Path| {
+        let (map, _) = storage::load_from_path(path).expect("loads");
+        map.node(map.root()).expect("root").text().to_owned()
+    };
+
+    // Off by default.
+    app.edit_map(|map| map.set_text(root, "edited"));
+    assert_eq!(app.auto_save_file(100.0), None);
+    assert!(app.dirty);
+
+    // On: saved once two seconds have passed since the change (the test clock is 0).
+    app.set_auto_save(true);
+    assert_eq!(app.auto_save_file(1.5), Some(0.5));
+    assert_eq!(app.auto_save_file(2.5), None);
+    assert!(!app.dirty);
+    assert_eq!(on_disk(&path), "edited");
+
+    // Another window saves the file: auto-save stops instead of replacing that.
+    storage::save_to_path(&MindMap::new("from elsewhere"), &path).expect("save succeeds");
+    app.edit_map(|map| map.set_text(root, "edited again"));
+    assert_eq!(app.auto_save_file(10.0), None);
+    assert!(app.status.starts_with("Auto-save paused"), "{}", app.status);
+    assert!(app.dirty);
+    assert_eq!(on_disk(&path), "from elsewhere");
+
+    // A map without a file waits for its first Save.
+    let mut untitled = MindMapApp::with_map(MindMap::new("new"));
+    untitled.set_auto_save(true);
+    untitled.mark_dirty();
+    assert_eq!(untitled.auto_save_file(100.0), None);
+    assert!(untitled.dirty);
+}

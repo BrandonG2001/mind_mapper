@@ -634,3 +634,95 @@ fn a_pasted_image_appears_on_the_selected_node() {
     );
     assert!(after.width() >= 120.0);
 }
+
+/// Drag with the mouse from `from` to `to`, in steps egui recognises as a drag.
+fn drag_between(harness: &mut Harness<'static, MindMapApp>, from: Pos2, to: Pos2) {
+    harness.hover_at(from);
+    harness.drag_at(from);
+    harness.run();
+    for step in 1..=5_u8 {
+        let t = f32::from(step) / 5.0;
+        harness.hover_at(from + (to - from) * t);
+        harness.run();
+    }
+    harness.drop_at(to);
+    harness.run();
+}
+
+#[test]
+fn dragging_outline_rows_moves_branches() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    harness.key_press_modifiers(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
+    harness.run();
+    let (risk, goals, first, second) = {
+        let app = harness.state();
+        (
+            node_named(app, "Risk"),
+            node_named(app, "Goals"),
+            node_named(app, "Objective 1"),
+            node_named(app, "Objective 2"),
+        )
+    };
+    let row = |harness: &Harness<'static, MindMapApp>, label| {
+        outline_row(harness, label).expect("row").rect()
+    };
+
+    // Onto the middle of a row: the branch becomes that node's child.
+    let (from, to) = (
+        row(&harness, "Risk").center(),
+        row(&harness, "Goals").center(),
+    );
+    drag_between(&mut harness, from, to);
+    assert_eq!(
+        harness.state().map.node(risk).expect("live").parent(),
+        Some(goals)
+    );
+
+    // Onto the top edge of a row: the branch goes just before that node.
+    let target = row(&harness, "Objective 1");
+    let from = row(&harness, "Objective 2").center();
+    drag_between(
+        &mut harness,
+        from,
+        Pos2::new(target.center().x, target.top() + 1.0),
+    );
+    let app = harness.state();
+    assert_eq!(
+        app.map.node(goals).expect("live").children(),
+        &[second, first, risk]
+    );
+    // The canvas shows the same order: the moved node is now above its sibling.
+    let y = |id| app.map.node(id).expect("live").position().y;
+    assert!(y(second) < y(first), "{} {}", y(second), y(first));
+}
+
+#[test]
+fn ctrl_h_replaces_text_across_the_map() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    harness.get_by_label("Auto-save");
+
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::H);
+    harness.run();
+    // The keyboard is in the search field.
+    harness.event(Event::Text("phase".to_owned()));
+    harness.run();
+    // Both fields are named after their labels, for screen readers.
+    harness
+        .query_all_by_role(eframe::egui::accesskit::Role::TextInput)
+        .find(|field| field.accesskit_node().label().as_deref() == Some("Replace with"))
+        .expect("the replacement field is named")
+        .focus();
+    harness.run();
+    harness.event(Event::Text("Stage".to_owned()));
+    harness.run();
+    harness.get_by_label("Replace all").click();
+    harness.run();
+
+    let app = harness.state();
+    assert_eq!(app.status, "Replaced 3 occurrences");
+    for name in ["Stage 1", "Stage 2", "Stage 3"] {
+        node_named(app, name);
+    }
+}

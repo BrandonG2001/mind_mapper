@@ -37,6 +37,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// When a check last found the app up to date, in seconds since 1970.
     pub last_update_check: Option<u64>,
+    /// Whether to save the map file automatically shortly after each change.
+    pub auto_save: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             recent: RecentFiles::default(),
             check_updates: true,
             last_update_check: None,
+            auto_save: false,
         }
     }
 }

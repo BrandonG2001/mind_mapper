@@ -1,23 +1,77 @@
-//! Crash recovery copies and the background jobs that write them and exports.
+//! Saving automatically: the map file itself shortly after each change (if switched on),
+//! crash recovery copies, and the background jobs that write those and exports.
 
 use std::time::Duration;
 
 use eframe::egui;
 
-use super::{AUTOSAVE_SECONDS, MindMapApp};
+use super::{AUTO_SAVE_DELAY, AUTOSAVE_SECONDS, MindMapApp, file_label};
 use crate::background::{Job, JobState};
 use crate::storage::StorageError;
 
+/// Saving the map file itself shortly after each change.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct FileAutoSave {
+    /// Whether it is switched on (a setting, off by default).
+    pub(super) enabled: bool,
+    /// When the map last changed, in egui's clock (seconds).
+    pub(super) changed_at: f64,
+    /// The map revision auto-save stopped at because the file changed elsewhere; it
+    /// tries again after the next edit (and asks nothing: Save lets the user choose).
+    blocked_at: Option<u64>,
+}
+
 impl MindMapApp {
-    /// Write a recovery copy if there are new changes and enough time has passed.
+    /// Save the map file if auto-save is on, the map has one and unsaved changes, and
+    /// nothing has changed for [`AUTO_SAVE_DELAY`] seconds up to `now`.
+    ///
+    /// # Returns
+    ///
+    /// How long to wait before it is due, if it will be.
+    pub(super) fn auto_save_file(&mut self, now: f64) -> Option<f64> {
+        let busy = self.question.is_some() || self.editing.is_some() || self.label_edit.is_some();
+        let state = &self.file_autosave;
+        if !state.enabled || !self.dirty || busy || state.blocked_at == Some(self.revision) {
+            return None;
+        }
+        // New maps and imports have no file yet: the first Save picks it.
+        let path = self.file_path.clone()?;
+        let due = state.changed_at + AUTO_SAVE_DELAY;
+        if now < due {
+            return Some(due - now);
+        }
+        if self.would_overwrite_changes(&path) {
+            self.file_autosave.blocked_at = Some(self.revision);
+            self.status = format!(
+                "Auto-save paused: {} was changed elsewhere; Save to choose what to keep",
+                file_label(&path)
+            );
+            return None;
+        }
+        self.write_to(path);
+        None
+    }
+
+    /// Turn auto-save on or off (remembered between runs).
+    pub(super) fn set_auto_save(&mut self, on: bool) {
+        self.file_autosave.enabled = on;
+        self.update_settings(|settings| settings.auto_save = on);
+    }
+
+    /// Write a recovery copy if there are new changes and enough time has passed, and
+    /// save the map file if auto-save is due.
     pub(super) fn autosave(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        if let Some(wait) = self.auto_save_file(now) {
+            // egui only redraws on input, so ask for a wake-up when the save is due.
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
         if !self.autosave_pending {
             return;
         }
         if self.recovery.is_none() {
             return;
         }
-        let now = ctx.input(|input| input.time);
         let due = self.last_autosave + AUTOSAVE_SECONDS;
         if now < due {
             // egui only redraws on input, so ask for a wake-up when the save is due.

@@ -1,12 +1,46 @@
 //! The outline view: the map as an indented list in a side panel (Ctrl+Shift+O), kept in
 //! step with the canvas. Clicking a row selects its node (and shows it on the canvas),
-//! double-clicking renames it in place, and the +/- buttons fold branches.
+//! double-clicking renames it in place, the +/- buttons fold branches, and dragging a row
+//! onto another moves its branch there.
 
-use eframe::egui::{self, Key, ScrollArea, TextEdit, Ui};
+use eframe::egui::{self, Key, Rect, ScrollArea, Sense, Stroke, TextEdit, Ui};
 
 use super::canvas::take_plain_enter;
-use super::{EditSession, MindMapApp};
-use crate::model::{MindMap, NodeId};
+use super::{EditSession, MindMapApp, node_label};
+use crate::layout;
+use crate::model::{MapError, MindMap, Node, NodeId};
+
+/// Share of a row's height, at its top and bottom, where a drop places the branch before
+/// or after the row's node instead of inside it.
+const EDGE_SHARE: f32 = 0.25;
+
+/// Where a branch dragged onto a row goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DropPlace {
+    /// Just before the row's node, as its sibling.
+    Before,
+    /// Inside, as the row's node's last child.
+    Inside,
+    /// Just after the row's node, as its sibling.
+    After,
+}
+
+impl DropPlace {
+    /// Where a drop at height `y` on a row occupying `row` goes: near the top or bottom
+    /// edge places beside it (unless it is the central idea, which has no siblings).
+    fn at(row: Rect, y: f32, is_root: bool) -> Self {
+        let edge = row.height() * EDGE_SHARE;
+        if is_root {
+            Self::Inside
+        } else if y < row.top() + edge {
+            Self::Before
+        } else if y > row.bottom() - edge {
+            Self::After
+        } else {
+            Self::Inside
+        }
+    }
+}
 
 /// Indentation per level of the tree, in points.
 const INDENT: f32 = 16.0;
@@ -62,6 +96,12 @@ pub(super) enum OutlineEvent {
     Rename(NodeId),
     /// A row's +/- button was clicked.
     Fold(NodeId),
+    /// The row of `dragged` was dropped on the row of `target`.
+    Move {
+        dragged: NodeId,
+        target: NodeId,
+        place: DropPlace,
+    },
     /// The label being edited in the list was finished: kept, or abandoned with Esc.
     FinishEdit { keep: bool },
 }
@@ -153,7 +193,23 @@ impl MindMapApp {
         } else {
             first.to_owned()
         };
-        let response = ui.selectable_label(selected, label);
+        // Rows can also be dragged; the node's id travels with the drag.
+        let response = ui.selectable_label(selected, label).interact(Sense::drag());
+        response.dnd_set_drag_payload(id);
+        let pointer_y = ui.input(|input| input.pointer.interact_pos().map(|pos| pos.y));
+        let is_root = node.parent().is_none();
+        if let (Some(dragged), Some(y)) = (response.dnd_hover_payload::<NodeId>(), pointer_y)
+            && *dragged != id
+        {
+            show_drop_place(ui, response.rect, DropPlace::at(response.rect, y, is_root));
+        }
+        if let (Some(dragged), Some(y)) = (response.dnd_release_payload::<NodeId>(), pointer_y) {
+            events.push(OutlineEvent::Move {
+                dragged: *dragged,
+                target: id,
+                place: DropPlace::at(response.rect, y, is_root),
+            });
+        }
         if response.double_clicked() {
             events.push(OutlineEvent::Rename(id));
         } else if response.clicked() {
@@ -190,8 +246,64 @@ impl MindMapApp {
                 }
             }
             OutlineEvent::Fold(id) => self.toggle_collapse(id),
+            OutlineEvent::Move {
+                dragged,
+                target,
+                place,
+            } => self.move_from_outline(dragged, target, place),
             OutlineEvent::FinishEdit { keep: true } => self.commit_edit(),
             OutlineEvent::FinishEdit { keep: false } => self.editing = None,
+        }
+    }
+}
+
+impl MindMapApp {
+    /// Move the branch of `dragged`, dropped on the row of `target`, to `place` (one undo
+    /// step). Placing beside a node tidies that node's parent's branch, so the canvas shows
+    /// the same order as the list.
+    pub(super) fn move_from_outline(&mut self, dragged: NodeId, target: NodeId, place: DropPlace) {
+        if dragged == target {
+            return;
+        }
+        let moved = match place {
+            DropPlace::Inside => self.edit_map(|map| {
+                // Unfold the target so the dropped branch stays visible.
+                if map.node(target).is_some_and(Node::is_collapsed) {
+                    map.set_collapsed(target, false)?;
+                }
+                map.move_subtree(dragged, target)
+            }),
+            DropPlace::Before | DropPlace::After => self.edit_map(|map| {
+                map.move_beside(dragged, target, place == DropPlace::After)?;
+                let parent = map
+                    .node(target)
+                    .and_then(Node::parent)
+                    .ok_or(MapError::RootNode)?;
+                layout::tidy_branch(map, parent)
+            }),
+        };
+        if moved.is_some() {
+            self.select(Some(dragged));
+            self.reveal = Some(dragged);
+            self.status = format!("Moved \"{}\"", node_label(&self.map, dragged));
+        }
+    }
+}
+
+/// Show where a dragged branch would go: a line above or below the row, or a box around
+/// it for "inside".
+fn show_drop_place(ui: &Ui, row: Rect, place: DropPlace) {
+    let stroke = Stroke::new(2.0, ui.visuals().selection.stroke.color);
+    let painter = ui.painter();
+    match place {
+        DropPlace::Before => {
+            painter.hline(row.x_range(), row.top(), stroke);
+        }
+        DropPlace::After => {
+            painter.hline(row.x_range(), row.bottom(), stroke);
+        }
+        DropPlace::Inside => {
+            painter.rect_stroke(row, 2.0, stroke, egui::StrokeKind::Inside);
         }
     }
 }
@@ -234,6 +346,16 @@ fn row_offset(index: usize, pitch: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drops_near_a_row_edge_go_beside_it() {
+        let row = Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(200.0, 120.0));
+        assert_eq!(DropPlace::at(row, 101.0, false), DropPlace::Before);
+        assert_eq!(DropPlace::at(row, 110.0, false), DropPlace::Inside);
+        assert_eq!(DropPlace::at(row, 119.0, false), DropPlace::After);
+        // The central idea has no siblings.
+        assert_eq!(DropPlace::at(row, 101.0, true), DropPlace::Inside);
+    }
 
     #[test]
     fn rows_list_shown_nodes_with_their_depth_and_rebuild_on_change() {

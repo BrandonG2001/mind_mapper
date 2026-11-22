@@ -843,6 +843,50 @@ impl MindMap {
             })
     }
 
+    /// Re-attach `id` (with its whole branch) next to `sibling`, just before or `after` it
+    /// among `sibling`'s parent's children, on the same side of the map and just above or
+    /// below it. Running [`crate::layout::tidy_branch`] on the parent afterwards makes room.
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::NodeNotFound` if either node does not exist
+    /// * `MapError::RootNode` if either is the root (the root has no siblings)
+    /// * `MapError::WouldCreateCycle` if `sibling` is `id` or inside its branch
+    pub fn move_beside(
+        &mut self,
+        id: NodeId,
+        sibling: NodeId,
+        after: bool,
+    ) -> Result<(), MapError> {
+        let parent = self
+            .node(sibling)
+            .ok_or(MapError::NodeNotFound(sibling))?
+            .parent
+            .ok_or(MapError::RootNode)?;
+        if self.is_in_subtree(sibling, id) {
+            return Err(MapError::WouldCreateCycle);
+        }
+        self.move_subtree(id, parent)?;
+        let parent_x = self.node_mut(parent)?.position.x;
+        let target = self.node_mut(sibling)?.position;
+        let current = self.node_mut(id)?.position;
+        // A branch keeps growing away from the centre: flip it if it changes sides.
+        if (current.x < parent_x) != (target.x < parent_x) {
+            self.mirror_descendants(id, current.x)?;
+        }
+        // One unit above or below is enough for the layout to keep this order.
+        let offset = if after { 1.0 } else { -1.0 };
+        self.translate_subtree(id, target.x - current.x, target.y + offset - current.y)?;
+        let children = &mut self.node_mut(parent)?.children;
+        children.retain(|&child| child != id);
+        let at = children
+            .iter()
+            .position(|&child| child == sibling)
+            .map_or(children.len(), |index| index + usize::from(after));
+        children.insert(at, id);
+        Ok(())
+    }
+
     /// Reflect every descendant of `id` horizontally across the vertical line `axis_x`.
     fn mirror_descendants(&mut self, id: NodeId, axis_x: f32) -> Result<(), MapError> {
         let mut stack = self
@@ -1407,6 +1451,44 @@ mod tests {
         assert_eq!(visits, [(a, Some(0)), (a1, Some(0))]);
         assert_eq!(map.branch_index(b), Some(1));
         assert_eq!(map.branch_index(map.root()), None);
+    }
+
+    #[test]
+    fn moving_beside_a_sibling_sets_the_order_and_the_side() {
+        let mut map = MindMap::new("root");
+        let root = map.root();
+        let right = map
+            .add_child_at(root, "right", Point::new(100.0, 0.0))
+            .expect("root");
+        let left = map
+            .add_child_at(root, "left", Point::new(-100.0, 0.0))
+            .expect("root");
+        let moved = map
+            .add_child_at(right, "moved", Point::new(200.0, 50.0))
+            .expect("right");
+        let grandchild = map
+            .add_child_at(moved, "grandchild", Point::new(300.0, 50.0))
+            .expect("moved");
+
+        map.move_beside(moved, left, false).expect("valid");
+
+        let node = |id| map.node(id).expect("live");
+        assert_eq!(node(moved).parent(), Some(root));
+        assert_eq!(node(root).children(), &[right, moved, left]);
+        // Just above `left`, on its side, with its own child mirrored to keep growing out.
+        assert_eq!(node(moved).position(), Point::new(-100.0, -1.0));
+        assert!(node(grandchild).position().x < node(moved).position().x);
+
+        map.move_beside(right, moved, true).expect("valid");
+        assert_eq!(
+            map.node(root).expect("live").children(),
+            &[moved, right, left]
+        );
+        assert_eq!(
+            map.move_beside(moved, grandchild, true),
+            Err(MapError::WouldCreateCycle)
+        );
+        assert_eq!(map.move_beside(moved, root, true), Err(MapError::RootNode));
     }
 
     #[test]

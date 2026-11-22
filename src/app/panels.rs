@@ -7,7 +7,7 @@ use super::{Action, MindMapApp, Screen};
 use crate::details::DetailsEdit;
 use crate::model::NodeId;
 use crate::recovery::Recovered;
-use crate::search::SearchCommand;
+use crate::search::{self, SearchCommand};
 use crate::start_screen::StartChoice;
 use crate::theme::{theme_picker, ui_size_control};
 
@@ -160,6 +160,15 @@ impl MindMapApp {
         ui.horizontal(|ui| {
             theme_picker(ui, &mut self.theme);
             ui.separator();
+            let mut auto_save = self.file_autosave.enabled;
+            let toggle = ui.checkbox(&mut auto_save, "Auto-save").on_hover_text(
+                "Save the map file 2 seconds after each change. A new map needs one Save \
+                 first, to choose where it goes.",
+            );
+            if toggle.changed() {
+                self.set_auto_save(auto_save);
+            }
+            ui.separator();
             ui_size_control(ui);
             ui.separator();
             ui.label(format!("Map {:.0}%", self.view.camera().zoom() * 100.0))
@@ -239,6 +248,40 @@ impl MindMapApp {
         self.details = Some(panel);
     }
 
+    /// Replace the find bar's text with its replacement: in the current match only (then
+    /// go to the next match), or in every match. Either way one undo step.
+    fn replace_matches(&mut self, current_only: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let query = search.query().to_owned();
+        let replacement = search.replacement().to_owned();
+        let only = if current_only {
+            match search.current().or_else(|| search.first()) {
+                Some(id) => Some(id),
+                None => return,
+            }
+        } else if search.match_count() == 0 {
+            return;
+        } else {
+            None
+        };
+        let replaced = self.edit_map(|map| search::replace_in_map(map, &query, &replacement, only));
+        if let Some(count) = replaced {
+            self.status = match count {
+                1 => "Replaced 1 occurrence".to_owned(),
+                count => format!("Replaced {count} occurrences"),
+            };
+        }
+        let next = match (&mut self.search, only) {
+            (Some(search), Some(id)) => search.next_after_replace(&self.map, self.revision, id),
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.show_node(next);
+        }
+    }
+
     /// Act on a find-bar command: jump to the first, next or previous match, or close.
     pub(super) fn search_command(&mut self, command: SearchCommand) {
         let Some(search) = &mut self.search else {
@@ -251,6 +294,14 @@ impl MindMapApp {
             SearchCommand::Previous => search.step(false),
             SearchCommand::Close => {
                 self.search = None;
+                return;
+            }
+            SearchCommand::Replace => {
+                self.replace_matches(true);
+                return;
+            }
+            SearchCommand::ReplaceAll => {
+                self.replace_matches(false);
                 return;
             }
         };

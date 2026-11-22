@@ -37,12 +37,15 @@ keyboard, drag branches around and save your maps as plain JSON files.
   to..." in the right-click menu, then click the other node), with an optional label such
   as "depends on". They appear in exports too.
 - **Outline view** (Ctrl+Shift+O): the map as an indented list beside the canvas. Click a
-  row to select its node, double-click to rename it in place, +/- to fold a branch.
+  row to select its node, double-click to rename it in place, +/- to fold a branch, and
+  drag a row onto another to move its branch there.
 - **Pictures on nodes**: paste an image (Ctrl+V), drop a PNG or JPEG file onto a node, or
   choose "Add picture..." in the right-click menu. Pictures are saved inside the map file
   and appear in PNG, SVG and PDF exports.
-- **Find** any node by its text or notes; matches are highlighted and folded branches open
-  as needed.
+- **Find and replace** text in node labels and notes; matches are highlighted and folded
+  branches open as needed. Replace all is one undo step.
+- **Auto-save** (optional): tick it in the toolbar and the map file is saved 2 seconds
+  after each change. It never replaces changes another window made to the file.
 - **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
   document, or paste a bulleted list from anywhere into the map.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
@@ -124,6 +127,7 @@ mind_mapper path/to/ideas.json
 | Label or remove a link | Right-click either node and choose **Label link ...** or **Remove link ...** |
 | Add a picture to a node | Drop a PNG or JPEG file onto it, or right-click it and choose **Add picture...** |
 | Select or rename from the outline | Click a row to select its node; double-click to rename it there |
+| Move a branch in the outline | Drag its row onto another row: onto the middle to make it a child, near the top or bottom edge to place it before or after |
 | Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
@@ -149,6 +153,7 @@ mind_mapper path/to/ideas.json
 | Ctrl+C / Ctrl+X | Copy / cut the selected branches (or copy the whole map) as an indented outline |
 | Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node, or a copied image onto it |
 | Ctrl+Shift+O | Show or hide the outline view |
+| Ctrl+H | Find and replace (in labels and notes, ignoring case) |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
 | Ctrl+O | Open a map, or import an OPML (`.opml`) or FreeMind (`.mm`) file |
@@ -210,8 +215,8 @@ single tree, is rejected with an error message rather than partially loaded.
 Saving writes to a temporary file first and then swaps it into place, so a crash or full
 disk mid-save leaves the previous version intact.
 
-Settings (`settings.json`: theme, interface size, recent files and the update-check
-setting), the window size, your templates (one map file each in `templates/`) and the
+Settings (`settings.json`: theme, interface size, recent files, auto-save and the
+update-check setting), the window size, your templates (one map file each in `templates/`) and the
 crash-recovery copies live in the app's data folder. Settings are shared safely between
 open windows: each change is merged into the file rather than overwriting it.
 

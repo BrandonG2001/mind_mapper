@@ -40,6 +40,9 @@ mod updates;
 
 /// Application name: window title, and the folder name for settings and recovery data.
 pub const APP_NAME: &str = "Mind Mapper";
+/// How long after the last change auto-save saves the map file, so a burst of edits
+/// (typing, dragging) is saved once.
+const AUTO_SAVE_DELAY: f64 = 2.0;
 /// Minimum time between background copies of unsaved work.
 const AUTOSAVE_SECONDS: f64 = 20.0;
 /// Narrowest text box shown while editing, at 100% zoom.
@@ -91,6 +94,8 @@ enum Action {
     Find,
     FindNext,
     FindPrevious,
+    /// Open the find bar with its "Replace with" row.
+    Replace,
     /// Esc: cancel linking, or close the find bar, or else leave focus mode.
     Dismiss,
     /// Start a cross-link from the selected node to the next node clicked.
@@ -114,7 +119,7 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 29] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 30] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O),
         Action::ToggleOutline,
@@ -199,6 +204,10 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 29] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::F),
         Action::Find,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::H),
+        Action::Replace,
     ),
     (
         KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
@@ -300,6 +309,8 @@ pub struct MindMapApp {
     also_selected: HashSet<NodeId>,
     /// The check for a newer release: its setting, progress and result.
     updates: updates::Updates,
+    /// Saving the map file itself shortly after each change (a setting).
+    file_autosave: autosave::FileAutoSave,
     /// Where the user's own templates are kept; `None` if there is no data folder.
     template_folder: Option<TemplateFolder>,
     /// The node a cross-link is being drawn from, until the target is clicked.
@@ -377,6 +388,7 @@ impl MindMapApp {
         app.ui_zoom = settings.ui_zoom;
         app.recent = settings.recent;
         app.updates.enabled = settings.check_updates;
+        app.file_autosave.enabled = settings.auto_save;
         app.check_for_update_if_due(settings.last_update_check);
         // Set the option directly (not `set_zoom_factor`, which waits a frame) so the
         // first frame already uses the saved size.
@@ -430,6 +442,7 @@ impl MindMapApp {
             outline: None,
             template_folder: None,
             updates: updates::Updates::default(),
+            file_autosave: autosave::FileAutoSave::default(),
             also_selected: HashSet::new(),
             autosave_pending: false,
             last_autosave: 0.0,
@@ -452,6 +465,7 @@ impl MindMapApp {
         self.dirty = true;
         self.autosave_pending = true;
         self.revision = self.revision.wrapping_add(1);
+        self.file_autosave.changed_at = self.ctx.input(|input| input.time);
     }
 
     fn perform(&mut self, action: Action) {
@@ -539,6 +553,7 @@ impl MindMapApp {
                 Some(search) => search.request_focus(),
                 None => self.search = Some(Search::new()),
             },
+            Action::Replace => self.search.get_or_insert_with(Search::new).show_replace(),
             Action::FindNext => self.search_command(SearchCommand::Next),
             Action::FindPrevious => self.search_command(SearchCommand::Previous),
             Action::Dismiss => {
