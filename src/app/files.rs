@@ -21,6 +21,8 @@ impl MindMapApp {
                 theme: self.theme,
                 ui_zoom: self.ui_zoom,
                 recent: std::mem::take(&mut self.recent),
+                check_updates: self.updates.enabled,
+                last_update_check: None,
             };
             change(&mut settings);
             self.recent = settings.recent;
@@ -159,6 +161,7 @@ impl MindMapApp {
         let dialog = FileDialog::new()
             .add_filter("PNG image", &["png"])
             .add_filter("SVG drawing", &["svg"])
+            .add_filter("PDF document (light colours, for printing)", &["pdf"])
             .add_filter("Markdown outline", &["md"])
             .add_filter(IMPORT_FILTERS[0].0, IMPORT_FILTERS[0].1)
             .add_filter(IMPORT_FILTERS[1].0, IMPORT_FILTERS[1].1)

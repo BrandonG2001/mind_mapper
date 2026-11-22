@@ -1014,3 +1014,36 @@ fn opml_and_freemind_files_open_as_new_unsaved_maps() {
     assert!(app.status.starts_with("Could not import"), "{}", app.status);
     assert_eq!(app.map.len(), 4);
 }
+
+#[test]
+fn update_check_results_are_shown_or_remembered() {
+    let dir = TempDir::new("app_updates");
+    let (mut app, _) = app_with_three_children();
+    app.settings_file = Some(crate::settings::SettingsFile::in_dir(dir.path()));
+    let release = crate::update::Release {
+        version: crate::update::Version::parse("99.0.0").expect("valid"),
+        page: "https://github.com/BrandonG2001/mind_mapper/releases/tag/v99.0.0".to_owned(),
+    };
+
+    // Up to date: the time is remembered, so the next check waits a day.
+    app.finish_update_check(Ok(None));
+    let last = app
+        .settings_file
+        .as_ref()
+        .and_then(|file| file.load().last_update_check);
+    assert!(last.is_some());
+    assert!(!crate::update::is_due(last, crate::update::now_seconds()));
+
+    app.finish_update_check(Ok(Some(release.clone())));
+    assert_eq!(app.updates.available, Some(release));
+    assert_eq!(app.status, "Mind Mapper 99.0.0 is available");
+
+    // Turning checks off hides the offer and is remembered.
+    app.set_check_updates(false);
+    assert_eq!(app.updates.available, None);
+    let file = app.settings_file.as_ref().expect("set above");
+    assert!(!file.load().check_updates);
+    // With checks off, nothing is started.
+    app.check_for_update_if_due(None);
+    assert!(app.updates.job.is_none());
+}

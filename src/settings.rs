@@ -1,4 +1,5 @@
-//! User settings (theme, interface size, recent files), shared safely between windows.
+//! User settings (theme, interface size, recent files, update checks), shared safely
+//! between windows.
 //!
 //! Each change is a read-modify-write of `settings.json` while holding an exclusive lock
 //! on `settings.lock`, so two windows changing different settings never overwrite each
@@ -32,6 +33,10 @@ pub struct Settings {
     pub ui_zoom: f32,
     /// Recently opened or saved maps.
     pub recent: RecentFiles,
+    /// Whether to ask GitHub for newer releases.
+    pub check_updates: bool,
+    /// When a check last found the app up to date, in seconds since 1970.
+    pub last_update_check: Option<u64>,
 }
 
 impl Default for Settings {
@@ -40,6 +45,8 @@ impl Default for Settings {
             theme: ColorTheme::default(),
             ui_zoom: 1.0,
             recent: RecentFiles::default(),
+            check_updates: true,
+            last_update_check: None,
         }
     }
 }

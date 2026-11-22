@@ -42,6 +42,7 @@ pub mod start_screen;
 pub mod storage;
 pub mod templates;
 pub mod theme;
+pub mod update;
 pub mod user_templates;
 
 #[cfg(test)]

@@ -102,6 +102,7 @@ impl MindMapApp {
         if let Some(last) = messages.pop() {
             self.status = last;
         }
+        self.poll_update_check();
     }
 
     /// Look for unsaved work left by a window that is no longer running.

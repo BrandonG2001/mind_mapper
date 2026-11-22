@@ -4,7 +4,7 @@
 use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, Vec2};
 use egui_kittest::Harness;
 // `Queryable` provides `get_by_label` and friends on the harness.
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::{DEFAULT_ROOT_TEXT, MindMapApp, Screen};
 use crate::model::{MindMap, NodeId};
@@ -446,4 +446,35 @@ fn a_saved_template_can_start_a_map_and_be_removed() {
     harness.run();
     assert_eq!(harness.state().start.saved(), []);
     assert!(harness.query_by_label("Your templates").is_none());
+}
+
+#[test]
+fn screen_readers_see_each_node_nested_like_the_map() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let risks = node_named(harness.state(), "Risks");
+    {
+        let objective = harness.get_by_label("Objective 1");
+        let goals = objective.parent().expect("nested under its parent");
+        assert_eq!(goals.accesskit_node().label().as_deref(), Some("Goals"));
+        let project = goals.parent().expect("nested under the central idea");
+        assert_eq!(project.accesskit_node().label().as_deref(), Some("Project"));
+        let tree = project.parent().expect("inside the map's tree");
+        assert_eq!(tree.accesskit_node().label().as_deref(), Some("Mind map"));
+    }
+
+    // Activating a node, as a screen reader does, selects it.
+    harness.get_by_label("Risks").click_accesskit();
+    harness.run();
+
+    assert_eq!(harness.state().selected, Some(risks));
+    let node = harness.get_by_label("Risks");
+    assert_eq!(node.accesskit_node().is_selected(), Some(true));
+    // Its outline on screen is where the node is drawn.
+    let bounds = node.accesskit_node().bounding_box().expect("has bounds");
+    let drawn = harness.state().view.node_rect(risks).expect("drawn");
+    assert!(
+        (bounds.x0 - f64::from(drawn.min.x)).abs() < 1.0,
+        "{bounds:?} {drawn:?}"
+    );
 }

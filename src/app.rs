@@ -23,6 +23,7 @@ use crate::theme::{self, ColorTheme};
 use crate::user_templates::TemplateFolder;
 use questions::{AfterDiscard, Question};
 
+mod accessibility;
 mod autosave;
 mod canvas;
 mod editing;
@@ -31,6 +32,7 @@ mod focus;
 mod panels;
 mod questions;
 mod selection;
+mod updates;
 
 /// Application name: window title, and the folder name for settings and recovery data.
 pub const APP_NAME: &str = "Mind Mapper";
@@ -274,6 +276,8 @@ pub struct MindMapApp {
     deferred_open: Option<PathBuf>,
     /// Nodes selected besides the main one (`selected`), with Ctrl+click or a box.
     also_selected: HashSet<NodeId>,
+    /// The check for a newer release: its setting, progress and result.
+    updates: updates::Updates,
     /// Where the user's own templates are kept; `None` if there is no data folder.
     template_folder: Option<TemplateFolder>,
     /// A question shown over the window, waiting for the user's answer.
@@ -335,6 +339,7 @@ impl MindMapApp {
                     theme: ColorTheme::load(cc.storage),
                     ui_zoom: theme::load_ui_zoom(cc.storage).unwrap_or(1.0),
                     recent: RecentFiles::load(cc.storage),
+                    ..Settings::default()
                 };
                 app.update_settings(|settings| *settings = carried_over.clone());
                 carried_over
@@ -343,6 +348,8 @@ impl MindMapApp {
         app.theme = settings.theme;
         app.ui_zoom = settings.ui_zoom;
         app.recent = settings.recent;
+        app.updates.enabled = settings.check_updates;
+        app.check_for_update_if_due(settings.last_update_check);
         // Set the option directly (not `set_zoom_factor`, which waits a frame) so the
         // first frame already uses the saved size.
         cc.egui_ctx
@@ -391,6 +398,7 @@ impl MindMapApp {
             deferred_open: None,
             question: None,
             template_folder: None,
+            updates: updates::Updates::default(),
             also_selected: HashSet::new(),
             autosave_pending: false,
             last_autosave: 0.0,
@@ -629,10 +637,18 @@ impl eframe::App for MindMapApp {
                 can_return,
                 recovery: recovery_label.as_deref(),
                 recent: self.recent.paths(),
+                update: self.updates.available.as_ref(),
             };
+            let mut check_updates = self.updates.enabled;
             let choice = egui::CentralPanel::default()
-                .show(ui, |ui| self.start.show(ui, &context, &mut self.theme))
+                .show(ui, |ui| {
+                    self.start
+                        .show(ui, &context, &mut self.theme, &mut check_updates)
+                })
                 .inner;
+            if check_updates != self.updates.enabled {
+                self.set_check_updates(check_updates);
+            }
             if let Some(choice) = choice {
                 self.choose(choice);
             }

@@ -27,8 +27,8 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Collapse and expand branches** to keep large maps readable. Folded branches stay folded
   when the map is saved.
 - **Recent files** on the start screen for quick access to the maps you use most.
-- **Export** to a PNG image, an SVG drawing, a Markdown outline, an OPML outline or a
-  FreeMind map.
+- **Export** to a PNG image, an SVG drawing, a PDF document (light colours, for
+  printing, with selectable text), a Markdown outline, an OPML outline or a FreeMind map.
 - **Import** OPML outlines (from most outliners) and FreeMind / Freeplane `.mm` maps:
   labels, notes, links, colours, folded branches and sides come across, then the map is
   tidied.
@@ -50,6 +50,11 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Plain JSON files** that are easy to back up, diff or generate with other tools.
 - **Safe saving and crash recovery**: saves never leave a half-written file, and unsaved
   work is backed up in the background so it can be restored after a crash.
+- **Screen-reader support**: every node on the map is announced by name, nested like the
+  map, with its notes, folded state and selection; activating one selects it.
+- **Update check**: once a day the app asks GitHub whether a newer version exists and, if
+  so, links to it. Only the app's name and version are sent; untick "Check for updates"
+  on the start screen to turn it off.
 - **Portable builds** for Windows (x86-64) and Linux (x86-64 and ARM64). No installer or
   runtime needed.
 
@@ -125,7 +130,7 @@ mind_mapper path/to/ideas.json
 | Space | Collapse or expand the selected node's branch |
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
 | Alt+Up / Alt+Down | Swap the selected node (with its branch) with the sibling above / below it |
-| Ctrl+E | Export as PNG, SVG, Markdown, OPML or FreeMind (chosen by the file extension) |
+| Ctrl+E | Export as PNG, SVG, PDF, Markdown, OPML or FreeMind (chosen by the file extension) |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
 | Esc | Close the find bar, or leave focus mode |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
@@ -187,9 +192,9 @@ single tree, is rejected with an error message rather than partially loaded.
 Saving writes to a temporary file first and then swaps it into place, so a crash or full
 disk mid-save leaves the previous version intact.
 
-Settings (`settings.json`: theme, interface size and recent files), the window size, your
-templates (one map file each in `templates/`) and the crash-recovery copies live in the
-app's data folder. Settings are shared safely between
+Settings (`settings.json`: theme, interface size, recent files and the update-check
+setting), the window size, your templates (one map file each in `templates/`) and the
+crash-recovery copies live in the app's data folder. Settings are shared safely between
 open windows: each change is merged into the file rather than overwriting it.
 
 | OS | Folder |
@@ -209,6 +214,9 @@ cargo fmt --check                           # check formatting
 that drive the real app with simulated mouse and keyboard input through
 [egui_kittest](https://crates.io/crates/egui_kittest), with no window or GPU needed. They
 also fail if any widget lacks an accessible name for screen readers.
+
+The tests never use the network. One test checks the update check against the real GitHub
+API and only runs when asked for: `cargo test -- --ignored live_github`.
 
 GitHub Actions runs formatting, clippy and the tests on Windows and Linux for every push
 and pull request, cross-compiles the Linux ARM64 build, and checks that every dependency's
@@ -244,7 +252,8 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/layout.rs`](src/layout.rs) | Automatic, overlap-free layout (Tidy up, templates, imports) |
 | [`src/recent.rs`](src/recent.rs) | The recent-files list |
 | [`src/navigation.rs`](src/navigation.rs) | Arrow-key movement between nodes |
-| [`src/export.rs`](src/export.rs) | PNG, SVG, Markdown, OPML and FreeMind export |
+| [`src/export.rs`](src/export.rs) | PNG, SVG, PDF, Markdown, OPML and FreeMind export |
+| [`src/update.rs`](src/update.rs) | Asking GitHub for the latest release |
 | [`src/search.rs`](src/search.rs) | The find bar and node matching |
 | [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
 | [`src/details.rs`](src/details.rs) | Side panel for colour, notes and link |
@@ -263,6 +272,8 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
 | [`src/app/selection.rs`](src/app/selection.rs) | Multi-select, and the edits that act on every selected node |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |
+| [`src/app/updates.rs`](src/app/updates.rs) | The background update check and its setting |
+| [`src/app/accessibility.rs`](src/app/accessibility.rs) | Map nodes in the accessibility tree, for screen readers |
 
 ### Changing the icon
 

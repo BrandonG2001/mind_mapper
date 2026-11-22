@@ -12,6 +12,7 @@ use crate::map_view::MapView;
 use crate::model::MindMap;
 use crate::templates::{TEMPLATES, Template};
 use crate::theme::{ColorTheme, theme_picker, ui_size_control};
+use crate::update::Release;
 use crate::user_templates::SavedTemplate;
 
 /// Size of one template card.
@@ -62,6 +63,8 @@ pub struct StartContext<'a> {
     pub recovery: Option<&'a str>,
     /// Recently used files, newest first.
     pub recent: &'a [PathBuf],
+    /// A newer release of the app, if one was found.
+    pub update: Option<&'a Release>,
 }
 
 /// Template gallery with pre-built thumbnail maps.
@@ -142,6 +145,7 @@ impl StartScreen {
     /// * `ui` - Area to fill
     /// * `context` - Back button, recovery banner and recent files to show
     /// * `theme` - Colour theme, changeable from the picker at the top
+    /// * `check_updates` - The "Check for updates" setting, changeable at the top
     ///
     /// # Returns
     ///
@@ -151,6 +155,7 @@ impl StartScreen {
         ui: &mut Ui,
         context: &StartContext<'_>,
         theme: &mut ColorTheme,
+        check_updates: &mut bool,
     ) -> Option<StartChoice> {
         let can_return = context.can_return;
         let mut choice = None;
@@ -166,10 +171,22 @@ impl StartScreen {
                     // Plain spacing: a separator here would stretch to the full height.
                     ui.add_space(GAP);
                     ui_size_control(ui);
+                    ui.add_space(GAP);
+                    ui.checkbox(check_updates, "Check for updates")
+                        .on_hover_text(
+                            "Once a day, ask GitHub whether a newer version exists. Only the \
+                         app's name and version are sent.",
+                        );
                 });
                 ui.vertical_centered(|ui| {
                     ui.heading(RichText::new("Mind Mapper").size(30.0).strong());
                     ui.label("Choose a template to start a new mind map");
+                    if let Some(release) = context.update {
+                        ui.hyperlink_to(
+                            format!("Mind Mapper {} is available: download it", release.version),
+                            &release.page,
+                        );
+                    }
                     ui.add_space(GAP);
                     if ui
                         .button("Open existing map...")

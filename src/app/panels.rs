@@ -96,7 +96,7 @@ impl MindMapApp {
                 "Export",
                 Action::Export,
                 true,
-                "Ctrl+E: PNG, SVG or Markdown",
+                "Ctrl+E: PNG, SVG, PDF, Markdown, OPML or FreeMind",
             ),
             ("Find", Action::Find, true, "Ctrl+F"),
             (
@@ -154,6 +154,14 @@ impl MindMapApp {
                 .on_hover_text("Map zoom: scroll wheel");
             ui.separator();
             ui.label(&self.status);
+            if let Some(release) = &self.updates.available {
+                ui.separator();
+                ui.hyperlink_to(
+                    format!("Version {} is available", release.version),
+                    &release.page,
+                )
+                .on_hover_text("Open the release page to download it");
+            }
         });
         clicked
     }

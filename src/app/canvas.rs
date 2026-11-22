@@ -247,6 +247,7 @@ impl MindMapApp {
         self.view.paint(&painter, ui.visuals(), &self.map, |id| {
             main == Some(id) || others.contains(&id)
         });
+        self.describe_nodes(ui, &response);
         if let Some(search) = &self.search {
             self.view.outline_where(
                 &painter,

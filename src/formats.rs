@@ -240,7 +240,7 @@ fn push_attribute(out: &mut String, name: &str, value: &str) {
 /// Append `text` with the characters XML gives a meaning to escaped. Line breaks and tabs
 /// become character references so they survive inside attributes; other control
 /// characters, which XML 1.0 does not allow at all, are dropped.
-fn push_escaped(out: &mut String, text: &str) {
+pub(crate) fn push_escaped(out: &mut String, text: &str) {
     for character in text.chars() {
         match character {
             '&' => out.push_str("&amp;"),

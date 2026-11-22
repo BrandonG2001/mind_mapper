@@ -298,6 +298,12 @@ impl MapView {
         }
     }
 
+    /// Every node drawn in the last [`MapView::paint`] call and where, parents before
+    /// children.
+    pub fn drawn(&self) -> impl Iterator<Item = (NodeId, Rect)> + '_ {
+        self.layout.iter().map(|node| (node.id, node.rect))
+    }
+
     /// Where `id` was drawn in the last [`MapView::paint`] call, or `None` if it was not
     /// visible.
     #[must_use]
