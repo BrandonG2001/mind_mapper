@@ -7,7 +7,7 @@ use super::*;
 use crate::clipboard;
 use crate::details::{self, DetailsEdit};
 use crate::model::MapError;
-use crate::start_screen::StartChoice;
+use crate::start_screen::{StartChoice, TemplateId};
 use crate::storage;
 use crate::test_support::TempDir;
 
@@ -295,7 +295,7 @@ fn search_jumps_to_matches_and_unfolds_hidden_ones() {
     assert_eq!(app.selected, Some(hidden));
     assert!(!app.map.node(child).expect("child").is_collapsed());
     assert_eq!(app.reveal, Some(hidden));
-    app.perform(Action::CloseFind);
+    app.perform(Action::Dismiss);
     assert!(app.search.is_none());
 }
 
@@ -401,9 +401,12 @@ fn app_starts_on_start_screen() {
 #[test]
 fn choosing_a_template_opens_it_in_the_editor() {
     let mut app = MindMapApp::with_map(MindMap::new("root"));
-    let expected = app.start.template_map(2).expect("template exists");
+    let expected = app
+        .start
+        .template_map(TemplateId::BuiltIn(2))
+        .expect("template exists");
 
-    app.choose(StartChoice::Template(2));
+    app.choose(StartChoice::Template(TemplateId::BuiltIn(2)));
 
     assert_eq!(app.screen, Screen::Editor);
     assert_eq!(app.map, expected);
@@ -645,7 +648,7 @@ fn unsaved_work_is_kept_until_discarding_is_agreed() {
     assert_eq!(app.map.len(), 1);
 
     // Nothing unsaved now, so nothing to ask.
-    app.discard_then(AfterDiscard::Template(0));
+    app.discard_then(AfterDiscard::Template(TemplateId::BuiltIn(0)));
     assert!(app.question.is_none());
     assert_eq!(app.file_path, None);
 }
@@ -735,7 +738,7 @@ fn missing_recent_file_is_removed() {
 fn out_of_range_template_is_ignored() {
     let mut app = MindMapApp::with_map(MindMap::new("root"));
 
-    app.choose(StartChoice::Template(usize::MAX));
+    app.choose(StartChoice::Template(TemplateId::BuiltIn(usize::MAX)));
 
     assert_eq!(app.screen, Screen::Start { can_return: false });
 }
@@ -908,4 +911,106 @@ fn folding_or_undoing_drops_nodes_that_are_gone_from_the_selection() {
     app.focus(added);
     app.perform(Action::Undo);
     assert_eq!(app.selection().collect::<Vec<_>>(), vec![b]);
+}
+
+#[test]
+fn focus_mode_shows_one_branch_until_dismissed() {
+    let (mut app, [a, b, _]) = app_with_three_children();
+    let a1 = app.map.add_child(a, "a1").expect("a");
+    app.select(Some(app.map.root()));
+    app.perform(Action::ToggleFocus);
+    assert_eq!(app.view.focus(), None, "{}", app.status);
+
+    app.select(Some(a1));
+    app.perform(Action::ToggleFocus);
+    assert_eq!(app.view.focus(), Some(a1));
+    app.perform(Action::Dismiss);
+    assert_eq!(app.view.focus(), None);
+
+    app.select(Some(a));
+    app.toggle_selected(b);
+    app.focus(a);
+    app.perform(Action::ToggleFocus);
+    assert_eq!(app.view.focus(), Some(a));
+    // b is outside the branch, so it is no longer selected.
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![a]);
+    // The arrows stay inside: Left from the focused branch would go to its parent.
+    app.perform(Action::Navigate(Direction::Left));
+    assert_eq!(app.selected, Some(a));
+    app.perform(Action::Navigate(Direction::Right));
+    assert_eq!(app.selected, Some(a1));
+}
+
+#[test]
+fn focus_mode_ends_when_something_outside_must_be_shown() {
+    let (mut app, [a, b, _]) = app_with_three_children();
+    app.select(Some(a));
+    app.perform(Action::ToggleFocus);
+
+    // A sibling of the focused branch is outside it.
+    app.perform(Action::AddSibling);
+    assert_eq!(app.view.focus(), None);
+    app.commit_edit();
+
+    app.select(Some(a));
+    app.perform(Action::ToggleFocus);
+    app.show_node(b);
+    assert_eq!(app.view.focus(), None);
+
+    app.select(Some(a));
+    app.perform(Action::ToggleFocus);
+    app.perform(Action::Delete);
+    app.check_focus();
+    assert_eq!(app.view.focus(), None);
+}
+
+#[test]
+fn saved_templates_appear_on_the_start_screen_and_can_be_removed() {
+    let dir = TempDir::new("app_templates");
+    let (mut app, _) = app_with_three_children();
+    app.template_folder = Some(crate::user_templates::TemplateFolder::in_dir(dir.path()));
+
+    app.perform(Action::SaveTemplate);
+    assert!(app.status.starts_with("Saved \"root\""), "{}", app.status);
+    app.perform(Action::SaveTemplate);
+    assert_eq!(app.status, "Replaced the template \"root\"");
+    assert_eq!(app.start.saved().len(), 1);
+
+    app.dirty = false;
+    app.choose(StartChoice::Template(TemplateId::Saved(0)));
+    assert_eq!(app.map.len(), 4);
+    assert_eq!(app.file_path, None);
+
+    app.choose(StartChoice::RemoveTemplate(0));
+    assert!(matches!(
+        app.question,
+        Some(Question::RemoveTemplate { .. })
+    ));
+    app.answer(true);
+    assert_eq!(app.start.saved(), []);
+    assert_eq!(app.status, "Removed the template \"root\"");
+}
+
+#[test]
+fn opml_and_freemind_files_open_as_new_unsaved_maps() {
+    let dir = TempDir::new("app_import");
+    let (mut app, _) = app_with_three_children();
+    let outline = dir.path().join("plan.opml");
+    std::fs::write(&outline, crate::formats::opml::write(&app.map)).expect("writable");
+    let broken = dir.path().join("broken.mm");
+    std::fs::write(&broken, "<map>").expect("writable");
+    app.dirty = false;
+
+    app.open_path(&outline);
+    assert_eq!(
+        app.status,
+        "Imported plan.opml; Save keeps it as a mind map"
+    );
+    assert_eq!(app.map.len(), 4);
+    // Saving must not overwrite the outline with this app's own format.
+    assert_eq!(app.file_path, None);
+
+    app.open_path(&broken);
+    assert!(app.status.starts_with("Could not import"), "{}", app.status);
+    assert_eq!(app.map.len(), 4);
 }

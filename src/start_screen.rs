@@ -1,4 +1,5 @@
-//! The start screen: a gallery of templates to begin a new mind map from.
+//! The start screen: a gallery of templates (built-in and the user's own) to begin a new
+//! mind map from.
 
 use std::path::PathBuf;
 
@@ -11,6 +12,7 @@ use crate::map_view::MapView;
 use crate::model::MindMap;
 use crate::templates::{TEMPLATES, Template};
 use crate::theme::{ColorTheme, theme_picker, ui_size_control};
+use crate::user_templates::SavedTemplate;
 
 /// Size of one template card.
 const CARD_SIZE: Vec2 = Vec2::new(240.0, 210.0);
@@ -23,11 +25,22 @@ const RECENT_WIDTH: f32 = 520.0;
 /// Rounded-corner radius of cards.
 const CARD_RADIUS: f32 = 10.0;
 
+/// Which template a new map starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateId {
+    /// `TEMPLATES[index]`.
+    BuiltIn(usize),
+    /// The user's template at this index of [`StartScreen::saved`].
+    Saved(usize),
+}
+
 /// What the user picked on the start screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartChoice {
-    /// Start a new map from `TEMPLATES[index]`.
-    Template(usize),
+    /// Start a new map from a template.
+    Template(TemplateId),
+    /// Delete the user's template at this index (after asking).
+    RemoveTemplate(usize),
     /// Open an existing file instead.
     Open,
     /// Return to the map that was open before the start screen was shown.
@@ -56,6 +69,10 @@ pub struct StartContext<'a> {
 pub struct StartScreen {
     /// `maps[i]` is `TEMPLATES[i]` already built, so thumbnails don't rebuild per frame.
     maps: Vec<MindMap>,
+    /// The user's own templates.
+    saved: Vec<SavedTemplate>,
+    /// Card description of each of `saved`.
+    saved_descriptions: Vec<String>,
     /// Scratch view reused to draw every thumbnail.
     preview: MapView,
 }
@@ -64,20 +81,58 @@ impl Default for StartScreen {
     fn default() -> Self {
         Self {
             maps: TEMPLATES.iter().map(Template::build).collect(),
+            saved: Vec::new(),
+            saved_descriptions: Vec::new(),
             preview: MapView::default(),
         }
     }
 }
 
+/// What a card shows.
+struct Card<'a> {
+    name: &'a str,
+    description: &'a str,
+    map: &'a MindMap,
+}
+
+/// Something done to a card in a gallery.
+enum CardEvent {
+    /// The card at this index was clicked.
+    Open(usize),
+    /// "Remove template" was chosen from the card's right-click menu.
+    Remove(usize),
+}
+
 impl StartScreen {
-    /// A fresh copy of the map for template `index`.
+    /// A fresh copy of the map for template `id`.
     ///
     /// # Returns
     ///
-    /// `None` if `index` is out of range.
+    /// `None` if there is no such template.
     #[must_use]
-    pub fn template_map(&self, index: usize) -> Option<MindMap> {
-        self.maps.get(index).cloned()
+    pub fn template_map(&self, id: TemplateId) -> Option<MindMap> {
+        match id {
+            TemplateId::BuiltIn(index) => self.maps.get(index).cloned(),
+            TemplateId::Saved(index) => self.saved.get(index).map(|saved| saved.map().clone()),
+        }
+    }
+
+    /// The user's templates shown after the built-in ones.
+    #[must_use]
+    pub fn saved(&self) -> &[SavedTemplate] {
+        &self.saved
+    }
+
+    /// Show `templates` as the user's own templates.
+    pub fn set_saved(&mut self, templates: Vec<SavedTemplate>) {
+        self.saved_descriptions = templates
+            .iter()
+            .map(|template| match template.map().len() {
+                1 => "Your template, 1 idea".to_owned(),
+                count => format!("Your template, {count} ideas"),
+            })
+            .collect();
+        self.saved = templates;
     }
 
     /// Draw the start screen.
@@ -141,100 +196,146 @@ impl StartScreen {
                         ui.add_space(GAP);
                     }
                 });
-                if let Some(index) = self.gallery(ui) {
-                    choice = Some(StartChoice::Template(index));
+                let built_in: Vec<Card<'_>> = TEMPLATES
+                    .iter()
+                    .zip(&self.maps)
+                    .map(|(template, map)| Card {
+                        name: template.name,
+                        description: template.description,
+                        map,
+                    })
+                    .collect();
+                if let Some(CardEvent::Open(index)) =
+                    gallery(ui, &mut self.preview, &built_in, false)
+                {
+                    choice = Some(StartChoice::Template(TemplateId::BuiltIn(index)));
+                }
+                ui.add_space(GAP);
+                if self.saved.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.weak("Tip: Save as template in the toolbar adds any map here.");
+                    });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Your templates").strong())
+                            .on_hover_text("Right-click a card to remove it");
+                    });
+                    let saved: Vec<Card<'_>> = self
+                        .saved
+                        .iter()
+                        .zip(&self.saved_descriptions)
+                        .map(|(template, description)| Card {
+                            name: template.name(),
+                            description,
+                            map: template.map(),
+                        })
+                        .collect();
+                    choice = match gallery(ui, &mut self.preview, &saved, true) {
+                        Some(CardEvent::Open(index)) => {
+                            Some(StartChoice::Template(TemplateId::Saved(index)))
+                        }
+                        Some(CardEvent::Remove(index)) => Some(StartChoice::RemoveTemplate(index)),
+                        None => choice,
+                    };
                 }
                 ui.add_space(GAP);
             });
         choice
     }
+}
 
-    /// Lay the cards out in as many centred columns as fit.
-    fn gallery(&mut self, ui: &mut Ui) -> Option<usize> {
-        let mut clicked = None;
-        let available = ui.available_width();
-        // Find the largest column count whose total width fits (at least one).
-        let columns = (1..=TEMPLATES.len())
-            .take_while(|&count| grid_width(count) <= available)
-            .last()
-            .unwrap_or(1);
-        let indent = ((available - grid_width(columns)) * 0.5).max(0.0);
-        ui.spacing_mut().item_spacing = Vec2::splat(GAP);
-        for row_start in (0..TEMPLATES.len()).step_by(columns) {
-            ui.horizontal(|ui| {
-                ui.add_space(indent);
-                for index in row_start..(row_start + columns).min(TEMPLATES.len()) {
-                    if self.card(ui, index) {
-                        clicked = Some(index);
-                    }
+/// Lay `cards` out in as many centred columns as fit. With `removable`, each card's
+/// right-click menu offers "Remove template".
+fn gallery(
+    ui: &mut Ui,
+    preview: &mut MapView,
+    cards: &[Card<'_>],
+    removable: bool,
+) -> Option<CardEvent> {
+    let mut event = None;
+    let available = ui.available_width();
+    // Find the largest column count whose total width fits (at least one).
+    let columns = (1..=cards.len().max(1))
+        .take_while(|&count| grid_width(count) <= available)
+        .last()
+        .unwrap_or(1);
+    let indent = ((available - grid_width(columns.min(cards.len().max(1)))) * 0.5).max(0.0);
+    ui.spacing_mut().item_spacing = Vec2::splat(GAP);
+    for row_start in (0..cards.len()).step_by(columns) {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            for (index, card) in cards.iter().enumerate().skip(row_start).take(columns) {
+                let response = draw_card(ui, preview, card);
+                if response.clicked() {
+                    event = Some(CardEvent::Open(index));
                 }
-            });
-        }
-        clicked
+                if removable {
+                    response.context_menu(|ui| {
+                        if ui.button("Remove template").clicked() {
+                            event = Some(CardEvent::Remove(index));
+                            ui.close();
+                        }
+                    });
+                }
+            }
+        });
     }
+    event
+}
 
-    /// Draw one template card.
-    ///
-    /// # Returns
-    ///
-    /// `true` if it was clicked.
-    fn card(&mut self, ui: &mut Ui, index: usize) -> bool {
-        let (rect, response) = ui.allocate_exact_size(CARD_SIZE, Sense::click());
-        // The card is painted by hand, so give it a name for screen readers (and UI tests).
-        if let Some(template) = TEMPLATES.get(index) {
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, template.name)
-            });
-        }
-        // Skip drawing cards scrolled out of view.
-        if ui.is_rect_visible(rect)
-            && let (Some(template), Some(map)) = (TEMPLATES.get(index), self.maps.get(index))
-        {
-            let visuals = ui.visuals();
-            let painter = ui.painter();
-            let border = if response.hovered() {
-                visuals.selection.stroke
-            } else {
-                visuals.widgets.noninteractive.bg_stroke
-            };
-            painter.rect(
-                rect,
-                CARD_RADIUS,
-                visuals.window_fill(),
-                border,
-                StrokeKind::Inside,
-            );
+/// Draw one template card, with a thumbnail of its map drawn by `preview`.
+fn draw_card(ui: &mut Ui, preview_view: &mut MapView, card: &Card<'_>) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(CARD_SIZE, Sense::click());
+    // The card is painted by hand, so give it a name for screen readers (and UI tests).
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, true, card.name));
+    // Skip drawing cards scrolled out of view.
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let painter = ui.painter();
+        let border = if response.hovered() {
+            visuals.selection.stroke
+        } else {
+            visuals.widgets.noninteractive.bg_stroke
+        };
+        painter.rect(
+            rect,
+            CARD_RADIUS,
+            visuals.window_fill(),
+            border,
+            StrokeKind::Inside,
+        );
 
-            let preview = Rect::from_min_size(rect.min, Vec2::new(CARD_SIZE.x, PREVIEW_HEIGHT))
-                .shrink(GAP * 0.5);
-            painter.rect_filled(preview, CARD_RADIUS * 0.6, visuals.extreme_bg_color);
-            self.preview.fit(map, preview.shrink(GAP * 0.5));
-            self.preview
-                .paint(&painter.with_clip_rect(preview), visuals, map, |_| false);
+        let preview =
+            Rect::from_min_size(rect.min, Vec2::new(CARD_SIZE.x, PREVIEW_HEIGHT)).shrink(GAP * 0.5);
+        painter.rect_filled(preview, CARD_RADIUS * 0.6, visuals.extreme_bg_color);
+        preview_view.fit(card.map, preview.shrink(GAP * 0.5));
+        preview_view.paint(&painter.with_clip_rect(preview), visuals, card.map, |_| {
+            false
+        });
 
-            let text_left = rect.min.x + GAP;
-            let title_top = preview.max.y + GAP * 0.5;
-            painter.text(
-                egui::pos2(text_left, title_top),
-                Align2::LEFT_TOP,
-                template.name,
-                FontId::proportional(17.0),
-                visuals.strong_text_color(),
-            );
-            let description = painter.layout(
-                template.description.to_owned(),
-                FontId::proportional(13.0),
-                visuals.weak_text_color(),
-                CARD_SIZE.x - GAP * 2.0,
-            );
-            painter.galley(
-                egui::pos2(text_left, title_top + 24.0),
-                description,
-                visuals.weak_text_color(),
-            );
-        }
-        response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+        let text_left = rect.min.x + GAP;
+        let title_top = preview.max.y + GAP * 0.5;
+        painter.text(
+            egui::pos2(text_left, title_top),
+            Align2::LEFT_TOP,
+            card.name,
+            FontId::proportional(17.0),
+            visuals.strong_text_color(),
+        );
+        let description = painter.layout(
+            card.description.to_owned(),
+            FontId::proportional(13.0),
+            visuals.weak_text_color(),
+            CARD_SIZE.x - GAP * 2.0,
+        );
+        painter.galley(
+            egui::pos2(text_left, title_top + 24.0),
+            description,
+            visuals.weak_text_color(),
+        );
     }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// A highlighted box offering to restore or discard work recovered after a crash.
@@ -307,11 +408,18 @@ mod tests {
         let screen = StartScreen::default();
 
         for (index, template) in TEMPLATES.iter().enumerate() {
-            let map = screen.template_map(index).expect("index in range");
+            let map = screen
+                .template_map(TemplateId::BuiltIn(index))
+                .expect("index in range");
             let root = map.node(map.root()).expect("root exists");
             assert_eq!(root.text(), template.root.text);
         }
-        assert!(screen.template_map(TEMPLATES.len()).is_none());
+        assert!(
+            screen
+                .template_map(TemplateId::BuiltIn(TEMPLATES.len()))
+                .is_none()
+        );
+        assert!(screen.template_map(TemplateId::Saved(0)).is_none());
     }
 
     #[test]

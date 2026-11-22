@@ -20,12 +20,14 @@ use crate::settings::{Settings, SettingsFile};
 use crate::start_screen::{StartContext, StartScreen};
 use crate::storage::{FileStamp, StorageError};
 use crate::theme::{self, ColorTheme};
+use crate::user_templates::TemplateFolder;
 use questions::{AfterDiscard, Question};
 
 mod autosave;
 mod canvas;
 mod editing;
 mod files;
+mod focus;
 mod panels;
 mod questions;
 mod selection;
@@ -53,6 +55,9 @@ const DEFAULT_ROOT_TEXT: &str = "Central idea";
 const NEW_NODE_TEXT: &str = "New idea";
 /// File-dialog filter name and extension.
 const FILE_FILTER: (&str, &[&str]) = ("Mind map", &["json"]);
+/// File-dialog filters for files that can be imported (opened as a new, unsaved map).
+const IMPORT_FILTERS: [(&str, &[&str]); 2] =
+    [("OPML outline", &["opml"]), ("FreeMind map", &["mm"])];
 /// Something the user can trigger from the toolbar or the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -73,11 +78,16 @@ enum Action {
     /// Swap the selected node with its sibling above (`Up`) or below (`Down`).
     Reorder(Direction),
     Export,
+    /// Save the map as one of the user's templates on the start screen.
+    SaveTemplate,
     Find,
     FindNext,
     FindPrevious,
-    CloseFind,
+    /// Esc: close the find bar, or else leave focus mode.
+    Dismiss,
     ToggleDetails,
+    /// Show only the selected branch, or the whole map again.
+    ToggleFocus,
 }
 
 /// A clipboard request, which egui reports as an event rather than a key press.
@@ -90,7 +100,7 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 26] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 27] = [
     // Before the plain arrows, which also match while Alt is held.
     (
         KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp),
@@ -174,7 +184,11 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 26] = [
     ),
     (
         KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
-        Action::CloseFind,
+        Action::Dismiss,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::F6),
+        Action::ToggleFocus,
     ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::E),
@@ -260,6 +274,8 @@ pub struct MindMapApp {
     deferred_open: Option<PathBuf>,
     /// Nodes selected besides the main one (`selected`), with Ctrl+click or a box.
     also_selected: HashSet<NodeId>,
+    /// Where the user's own templates are kept; `None` if there is no data folder.
+    template_folder: Option<TemplateFolder>,
     /// A question shown over the window, waiting for the user's answer.
     question: Option<Question>,
     /// The map changed since the last recovery copy was written.
@@ -332,6 +348,8 @@ impl MindMapApp {
         cc.egui_ctx
             .options_mut(|options| options.zoom_factor = app.ui_zoom);
         if let Some(dir) = data_dir {
+            app.template_folder = Some(TemplateFolder::in_dir(&dir));
+            app.reload_templates();
             match RecoveryStore::for_this_window(&dir) {
                 Ok(store) => {
                     app.recovery = Some(store);
@@ -372,6 +390,7 @@ impl MindMapApp {
             recovered: None,
             deferred_open: None,
             question: None,
+            template_folder: None,
             also_selected: HashSet::new(),
             autosave_pending: false,
             last_autosave: 0.0,
@@ -403,10 +422,11 @@ impl MindMapApp {
         let root = self.map.root();
         match action {
             Action::New => {
-                // Pick up files other windows opened since this one started.
+                // Pick up files and templates other windows saved since this one started.
                 if let Some(file) = &self.settings_file {
                     self.recent = file.load().recent;
                 }
+                self.reload_templates();
                 self.screen = Screen::Start { can_return: true };
             }
             Action::Open => self.discard_then(AfterDiscard::PickFile),
@@ -473,6 +493,7 @@ impl MindMapApp {
                 }
             }
             Action::Export => self.export_dialog(),
+            Action::SaveTemplate => self.save_as_template(),
             Action::Navigate(direction) => self.navigate(direction),
             Action::Reorder(direction) => self.reorder(direction),
             Action::Find => match &mut self.search {
@@ -481,7 +502,12 @@ impl MindMapApp {
             },
             Action::FindNext => self.search_command(SearchCommand::Next),
             Action::FindPrevious => self.search_command(SearchCommand::Previous),
-            Action::CloseFind => self.search = None,
+            Action::Dismiss => {
+                if self.search.take().is_none() {
+                    self.leave_focus();
+                }
+            }
+            Action::ToggleFocus => self.toggle_focus(),
             Action::ToggleDetails => {
                 if self.details.take().is_none() {
                     self.details = Some(DetailsPanel::default());

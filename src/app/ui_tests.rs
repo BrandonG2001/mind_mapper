@@ -8,6 +8,7 @@ use egui_kittest::kittest::Queryable;
 
 use super::{DEFAULT_ROOT_TEXT, MindMapApp, Screen};
 use crate::model::{MindMap, NodeId};
+use crate::start_screen::TemplateId;
 
 /// A harness around a fresh app that touches no files: settings, recovery and recent
 /// files are all off, unlike `MindMapApp::new`.
@@ -72,7 +73,10 @@ fn clicking_a_template_opens_it() {
     let app = harness.state();
     assert_eq!(
         app.map.len(),
-        app.start.template_map(2).expect("template").len()
+        app.start
+            .template_map(TemplateId::BuiltIn(2))
+            .expect("template")
+            .len()
     );
     assert!(!app.dirty);
     harness.get_by_label("Tidy up");
@@ -373,4 +377,73 @@ fn alt_down_moves_the_selected_node_below_its_sibling() {
     assert_eq!(app.selected, Some(first));
     let y = |id| app.map.node(id).expect("live").position().y;
     assert!(y(second) < y(first), "{} {}", y(second), y(first));
+}
+
+#[test]
+fn f6_shows_only_the_selected_branch_until_escape() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let (goals, objective, risks) = {
+        let app = harness.state();
+        (
+            node_named(app, "Goals"),
+            node_named(app, "Objective 1"),
+            node_named(app, "Risks"),
+        )
+    };
+    click_with(&mut harness, goals, Modifiers::NONE);
+
+    harness.key_press(Key::F6);
+    harness.run();
+    harness.run();
+
+    let app = harness.state();
+    assert!(app.view.node_rect(goals).is_some() && app.view.node_rect(objective).is_some());
+    assert!(app.view.node_rect(risks).is_none());
+    harness.get_by_label("Show all");
+    harness.key_press(Key::Escape);
+    harness.run();
+    harness.run();
+    assert!(harness.state().view.node_rect(risks).is_some());
+    harness.get_by_label("Focus");
+}
+
+#[test]
+fn a_saved_template_can_start_a_map_and_be_removed() {
+    let dir = crate::test_support::TempDir::new("ui_templates");
+    let mut harness = harness();
+    harness.state_mut().template_folder =
+        Some(crate::user_templates::TemplateFolder::in_dir(dir.path()));
+    open_template(&mut harness, "Project Plan");
+    let nodes = harness.state().map.len();
+
+    harness.get_by_label("Save as template").click();
+    harness.run();
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::N);
+    harness.run();
+    harness.get_by_label("Your templates");
+    // The template is named after the map's central idea.
+    harness.get_by_label("Project").click();
+    harness.run();
+    assert_eq!(harness.state().screen, Screen::Editor);
+    assert_eq!(harness.state().map.len(), nodes);
+
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::N);
+    harness.run();
+    let card = harness.get_by_label("Project").rect().center();
+    for pressed in [true, false] {
+        harness.event(Event::PointerButton {
+            pos: card,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    harness.run();
+    harness.get_by_label("Remove template").click();
+    harness.run();
+    harness.get_by_label("Remove").click();
+    harness.run();
+    assert_eq!(harness.state().start.saved(), []);
+    assert!(harness.query_by_label("Your templates").is_none());
 }

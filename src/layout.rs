@@ -13,6 +13,76 @@ pub(crate) const COLUMN_GAP: f32 = 70.0;
 /// Vertical space reserved for each leaf row, in world units.
 pub(crate) const ROW_HEIGHT: f32 = 56.0;
 
+/// Builds a new map one node at a time in reading order, then arranges it with [`tidy`].
+///
+/// Nodes get placeholder positions that only tell the layout which side of the root each
+/// top-level branch goes on, and that siblings run top to bottom in the order added. Used
+/// for templates and imported files, which have no positions of their own.
+#[derive(Debug, Clone)]
+pub struct TreeBuilder {
+    map: MindMap,
+    /// Grows with every node, so later siblings sort below earlier ones.
+    order: f32,
+}
+
+impl TreeBuilder {
+    /// Start a map whose central idea is labelled `root_text`.
+    #[must_use]
+    pub fn new(root_text: &str) -> Self {
+        Self {
+            map: MindMap::new(root_text),
+            order: 0.0,
+        }
+    }
+
+    /// The central idea.
+    #[must_use]
+    pub fn root(&self) -> NodeId {
+        self.map.root()
+    }
+
+    /// The map built so far, e.g. to give a new node notes or a colour.
+    pub const fn map_mut(&mut self) -> &mut MindMap {
+        &mut self.map
+    }
+
+    /// Add a node labelled `text` as the last child of `parent`.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - A node already in this map
+    /// * `text` - Label of the new node
+    /// * `left` - For a branch of the root: put it on the left. Ignored further out, where
+    ///   branches keep growing away from their parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `parent` is not in the map.
+    pub fn add(&mut self, parent: NodeId, text: &str, left: bool) -> Result<NodeId, MapError> {
+        self.order += 1.0;
+        let side = if left { -1.0 } else { 1.0 };
+        self.map
+            .add_child_at(parent, text, Point::new(side, self.order))
+    }
+
+    /// Lay the map out without overlaps and hand it over.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` only if the map is internally inconsistent.
+    pub fn finish(mut self) -> Result<MindMap, MapError> {
+        tidy(&mut self.map)?;
+        Ok(self.map)
+    }
+}
+
+/// Whether branch `index` of the root's `count` branches goes on the left when nothing
+/// says otherwise: the first half (rounded up) go right, the rest left.
+#[must_use]
+pub const fn balanced_left(index: usize, count: usize) -> bool {
+    index >= count.div_ceil(2)
+}
+
 /// Re-arrange every node of `map` so nothing overlaps. The root stays where it is.
 ///
 /// A collapsed node takes a single row; its hidden descendants are still arranged
@@ -187,6 +257,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn built_trees_keep_their_order_and_sides() {
+        let mut builder = TreeBuilder::new("root");
+        let root = builder.root();
+        let right = builder.add(root, "right", false).expect("root");
+        let first = builder.add(right, "first", true).expect("right");
+        let second = builder.add(right, "second", true).expect("right");
+        let left = builder.add(root, "left", true).expect("root");
+
+        let map = builder.finish().expect("consistent");
+
+        let position = |id| map.node(id).expect("live").position();
+        assert!(position(right).x > 0.0 && position(left).x < 0.0);
+        // Deeper nodes follow their branch, whatever `left` said.
+        assert!(position(first).x > position(right).x);
+        assert!(position(first).y < position(second).y);
+        assert_no_overlaps(&map);
+    }
+
+    #[test]
+    fn balanced_sides_put_the_extra_branch_on_the_right() {
+        let sides: Vec<bool> = (0..5).map(|index| balanced_left(index, 5)).collect();
+        assert_eq!(sides, [false, false, false, true, true]);
     }
 
     /// A map where every node was dropped on top of the root.

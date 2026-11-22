@@ -56,9 +56,29 @@ pub struct MapView {
     layout: Vec<LaidOutNode>,
     /// Reused every frame to avoid reallocating.
     accents: Accents,
+    /// The branch shown on its own in focus mode; `None` shows the whole map.
+    focus: Option<NodeId>,
 }
 
 impl MapView {
+    /// The branch shown on its own, if focus mode is on.
+    #[must_use]
+    pub const fn focus(&self) -> Option<NodeId> {
+        self.focus
+    }
+
+    /// Show only the branch of `id` (focus mode), or the whole map with `None`.
+    pub const fn set_focus(&mut self, id: Option<NodeId>) {
+        self.focus = id;
+    }
+
+    /// Where drawing starts: the focused branch if it still exists, else the root.
+    fn start(&self, map: &MindMap) -> NodeId {
+        self.focus
+            .filter(|&id| map.node(id).is_some())
+            .unwrap_or_else(|| map.root())
+    }
+
     /// The view's pan/zoom transform.
     #[must_use]
     pub const fn camera(&self) -> &Camera {
@@ -70,9 +90,10 @@ impl MapView {
         &mut self.camera
     }
 
-    /// Zoom and pan so the whole map fits inside `screen` (never above 100%).
+    /// Zoom and pan so the whole map (or the focused branch) fits inside `screen`, never
+    /// above 100%.
     pub fn fit(&mut self, map: &MindMap, screen: Rect) {
-        self.camera.fit(world_bounds(map), screen);
+        self.camera.fit(world_bounds(map, self.start(map)), screen);
     }
 
     /// Lay out the visible nodes of `map` and paint its edges and nodes.
@@ -104,22 +125,25 @@ impl MapView {
         let cull_rect = clip.expand(MAX_LABEL_WIDTH * zoom);
 
         self.layout.clear();
+        let start = self.start(map);
         self.accents.reset(map);
+        self.accents.prime(map, start, text_color);
         let handle_radius = HANDLE_RADIUS * zoom;
-        for visit in map.visible_preorder() {
+        for visit in map.visible_subtree_preorder(start) {
             let accent = self.accents.resolve(map, &visit, text_color);
             let center = self.camera.world_to_screen(visit.node.position());
             // Which way the branch grows: away from the parent (the root has no handle).
             let mut outward = None;
 
             if let Some(parent) = visit.node.parent().and_then(|id| map.node(id)) {
-                let start = self.camera.world_to_screen(parent.position());
-                outward = Some(if center.x >= start.x { 1.0 } else { -1.0 });
-                // The curve never leaves the box spanned by its end points.
-                if clip.intersects(Rect::from_two_pos(start, center)) {
-                    let bend = Vec2::new((center.x - start.x) * 0.5, 0.0);
+                let from = self.camera.world_to_screen(parent.position());
+                outward = Some(if center.x >= from.x { 1.0 } else { -1.0 });
+                // The curve never leaves the box spanned by its end points. The focused
+                // branch's own edge is left out, since its parent is not drawn.
+                if visit.id != start && clip.intersects(Rect::from_two_pos(from, center)) {
+                    let bend = Vec2::new((center.x - from.x) * 0.5, 0.0);
                     painter.add(CubicBezierShape::from_points_stroke(
-                        [start, start + bend, center - bend, center],
+                        [from, from + bend, center - bend, center],
                         false,
                         Color32::TRANSPARENT,
                         Stroke::new(edge_width, accent),
@@ -322,6 +346,19 @@ impl Accents {
         self.0.resize(map.slot_count(), Color32::TRANSPARENT);
     }
 
+    /// Resolve the ancestors of `start`, so a walk that begins at `start` gets the same
+    /// colours as a walk over the whole map.
+    pub(crate) fn prime(&mut self, map: &MindMap, start: NodeId, root_color: Color32) {
+        let branch = map.branch_index(start);
+        let ancestors: Vec<NodeId> = map.ancestors(start).collect();
+        // Root first, so each parent is resolved before its child.
+        for &id in ancestors.iter().rev() {
+            if let Some(node) = map.node(id) {
+                self.resolve(map, &Visit { id, node, branch }, root_color);
+            }
+        }
+    }
+
     /// The accent of `visit`. Its parent must have been resolved first, which a pre-order
     /// walk guarantees.
     pub(crate) fn resolve(
@@ -410,11 +447,13 @@ pub(crate) fn estimated_rect(node: &Node) -> Rect {
     )
 }
 
-/// World-space rectangle that (approximately) contains every visible node of `map`.
-fn world_bounds(map: &MindMap) -> Rect {
-    map.visible_preorder().fold(Rect::NOTHING, |bounds, visit| {
-        bounds.union(estimated_rect(visit.node))
-    })
+/// World-space rectangle that (approximately) contains every visible node of `start`'s
+/// branch of `map` (the whole map when `start` is the root).
+fn world_bounds(map: &MindMap, start: NodeId) -> Rect {
+    map.visible_subtree_preorder(start)
+        .fold(Rect::NOTHING, |bounds, visit| {
+            bounds.union(estimated_rect(visit.node))
+        })
 }
 
 #[cfg(test)]
@@ -481,6 +520,43 @@ mod tests {
             view.hit_test_where(Pos2::new(205.0, 205.0), |id| id != child),
             Some(map.root())
         );
+    }
+
+    #[test]
+    fn focus_draws_only_one_branch_in_its_usual_colours() {
+        let mut map = MindMap::new("root");
+        let root = map.root();
+        let a = map
+            .add_child_at(root, "a", Point::new(150.0, 0.0))
+            .expect("root");
+        let b = map
+            .add_child_at(root, "b", Point::new(150.0, 60.0))
+            .expect("root");
+        let b1 = map
+            .add_child_at(b, "b1", Point::new(300.0, 60.0))
+            .expect("b");
+        let mut view = MapView::default();
+        view.camera_mut().pan(Vec2::new(50.0, 100.0));
+        let accent_of = |view: &MapView, id| {
+            view.layout
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.accent)
+        };
+        headless_frame(Vec2::splat(500.0), |painter, visuals| {
+            view.paint(painter, visuals, &map, |_| false);
+        });
+        let usual = accent_of(&view, b1);
+
+        view.set_focus(Some(b));
+        headless_frame(Vec2::splat(500.0), |painter, visuals| {
+            view.paint(painter, visuals, &map, |_| false);
+        });
+
+        assert!(view.node_rect(root).is_none() && view.node_rect(a).is_none());
+        assert!(view.node_rect(b).is_some());
+        assert_eq!(accent_of(&view, b1), usual);
+        assert!(usual.is_some());
     }
 
     #[test]
@@ -612,7 +688,7 @@ mod tests {
         map.add_child_at(map.root(), "a much longer label", Point::new(400.0, -80.0))
             .expect("root exists");
 
-        let bounds = world_bounds(&map);
+        let bounds = world_bounds(&map, map.root());
 
         for (_, node) in map.iter() {
             assert!(bounds.contains_rect(estimated_rect(node)));

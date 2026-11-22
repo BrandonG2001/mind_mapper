@@ -231,6 +231,7 @@ impl MindMapApp {
 
     pub(super) fn canvas(&mut self, ui: &mut Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        self.check_focus();
         if self.needs_fit {
             self.view.fit(&self.map, response.rect);
             self.needs_fit = false;
@@ -312,8 +313,19 @@ impl MindMapApp {
         }
         let root = self.map.root();
         let can_move = |direction| navigation::neighbor(&self.map, id, direction).is_some();
+        let focus_label = if self.view.focus().is_some() {
+            "Show whole map"
+        } else {
+            "Focus on this branch"
+        };
         let menu_actions = [
             ("Rename", Action::Rename, true, "F2"),
+            (
+                focus_label,
+                Action::ToggleFocus,
+                id != root || self.view.focus().is_some(),
+                "F6",
+            ),
             (
                 "Move up",
                 Action::Reorder(Direction::Up),

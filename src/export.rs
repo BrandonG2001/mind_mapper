@@ -1,7 +1,8 @@
-//! Exporting a map as a PNG image, an SVG drawing or a Markdown outline.
+//! Exporting a map as a PNG image, an SVG drawing, a Markdown outline, an OPML outline or
+//! a FreeMind map.
 //!
 //! SVG and PNG show what is on screen: folded branches stay folded, and colours come from
-//! the current theme. Markdown is an outline of every node, folded or not.
+//! the current theme. The outline formats hold every node, folded or not.
 
 use std::fmt::{self, Write as _};
 use std::path::Path;
@@ -12,6 +13,7 @@ use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
 use crate::clipboard;
+use crate::formats::{Format, freemind, opml};
 use crate::map_view::{Accents, BASE_FONT_SIZE, LINE_HEIGHT, estimated_rect, wrap_label};
 use crate::model::MindMap;
 use crate::storage::{StorageError, write_atomically};
@@ -33,7 +35,7 @@ const FONT_FAMILY: &str = "Ubuntu, sans-serif";
 #[derive(Debug, Error)]
 pub enum ExportError {
     /// The chosen file name has no extension that names a known format.
-    #[error("the file name must end in .png, .svg or .md")]
+    #[error("the file name must end in .png, .svg, .md, .opml or .mm")]
     UnknownFormat,
     /// The image could not be rendered or encoded.
     #[error("could not render the image: {0}")]
@@ -52,6 +54,8 @@ pub enum ExportFormat {
     Svg,
     /// A nested bullet outline.
     Markdown,
+    /// A map in another app's format.
+    Other(Format),
 }
 
 impl ExportFormat {
@@ -63,7 +67,7 @@ impl ExportFormat {
             "png" => Some(Self::Png),
             "svg" => Some(Self::Svg),
             "md" | "markdown" => Some(Self::Markdown),
-            _ => None,
+            _ => Format::from_path(path).map(Self::Other),
         }
     }
 }
@@ -95,7 +99,8 @@ impl ExportStyle {
 ///
 /// # Errors
 ///
-/// * `ExportError::UnknownFormat` if the extension is not `.png`, `.svg` or `.md`
+/// * `ExportError::UnknownFormat` if the extension is not `.png`, `.svg`, `.md`, `.opml`
+///   or `.mm`
 /// * `ExportError::Render` if the PNG cannot be produced
 /// * `ExportError::Storage` if the file cannot be written
 pub fn export(map: &MindMap, style: ExportStyle, path: &Path) -> Result<(), ExportError> {
@@ -103,6 +108,8 @@ pub fn export(map: &MindMap, style: ExportStyle, path: &Path) -> Result<(), Expo
         ExportFormat::Png => to_png(map, style)?,
         ExportFormat::Svg => to_svg(map, style).into_bytes(),
         ExportFormat::Markdown => to_markdown(map).into_bytes(),
+        ExportFormat::Other(Format::Opml) => opml::write(map).into_bytes(),
+        ExportFormat::Other(Format::FreeMind) => freemind::write(map).into_bytes(),
     };
     write_atomically(path, |writer| Ok(writer.write_all(&bytes)?))?;
     Ok(())
@@ -316,6 +323,10 @@ mod tests {
         assert_eq!(
             ExportFormat::from_path(Path::new("a.markdown")),
             Some(ExportFormat::Markdown)
+        );
+        assert_eq!(
+            ExportFormat::from_path(Path::new("a.mm")),
+            Some(ExportFormat::Other(Format::FreeMind))
         );
         assert_eq!(ExportFormat::from_path(Path::new("a.txt")), None);
         assert_eq!(ExportFormat::from_path(Path::new("a")), None);

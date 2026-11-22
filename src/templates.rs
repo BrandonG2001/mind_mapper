@@ -2,10 +2,10 @@
 //!
 //! Each template is a static tree of labels. [`Template::build`] turns it into a
 //! [`MindMap`], spreading the root's branches over both sides and laying it out with
-//! [`layout::tidy`].
+//! [`tidy`](crate::layout::tidy).
 
-use crate::layout;
-use crate::model::{MindMap, NodeId, Point};
+use crate::layout::{TreeBuilder, balanced_left};
+use crate::model::{MindMap, NodeId};
 
 /// One label in a template tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +134,7 @@ impl Template {
     /// Create a new mind map from this template.
     ///
     /// The first half of the root's branches go to the right, the rest to the left, and
-    /// [`layout::tidy`] arranges everything without overlaps.
+    /// [`tidy`](crate::layout::tidy) arranges everything without overlaps.
     ///
     /// # Panics
     ///
@@ -142,29 +142,26 @@ impl Template {
     /// nodes this function has just created.
     #[must_use]
     pub fn build(&self) -> MindMap {
-        let mut map = MindMap::new(self.root.text);
-        let root = map.root();
-        let split = self.root.children.len().div_ceil(2);
-        // Placeholder positions only tell the layout each branch's side and order.
-        let mut order = 0.0;
+        let mut builder = TreeBuilder::new(self.root.text);
+        let root = builder.root();
+        let count = self.root.children.len();
         for (index, branch) in self.root.children.iter().enumerate() {
-            let side = if index < split { 1.0 } else { -1.0 };
-            add_branch(&mut map, root, branch, side, &mut order);
+            add_branch(&mut builder, root, branch, balanced_left(index, count));
         }
-        layout::tidy(&mut map).expect("every template node was just created");
-        map
+        builder
+            .finish()
+            .expect("every template node was just created")
     }
 }
 
-/// Add `spec` and its descendants under `parent`. `order` increases with each node so
-/// siblings keep the template's order when the layout sorts them top to bottom.
-fn add_branch(map: &mut MindMap, parent: NodeId, spec: &TemplateNode, side: f32, order: &mut f32) {
-    *order += 1.0;
-    let id = map
-        .add_child_at(parent, spec.text, Point::new(side, *order))
+/// Add `spec` and its descendants under `parent`. (Recursion is fine here: templates are
+/// a few levels deep and fixed at compile time.)
+fn add_branch(builder: &mut TreeBuilder, parent: NodeId, spec: &TemplateNode, left: bool) {
+    let id = builder
+        .add(parent, spec.text, left)
         .expect("parent was created earlier in this build");
     for child in spec.children {
-        add_branch(map, id, child, side, order);
+        add_branch(builder, id, child, left);
     }
 }
 

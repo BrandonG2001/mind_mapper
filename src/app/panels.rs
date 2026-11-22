@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Ui};
 
-use super::questions::AfterDiscard;
+use super::questions::{AfterDiscard, Question};
 use super::{Action, MindMapApp, Screen};
 use crate::details::DetailsEdit;
 use crate::model::NodeId;
@@ -15,7 +15,15 @@ impl MindMapApp {
     /// Act on a start-screen choice.
     pub(super) fn choose(&mut self, choice: StartChoice) {
         match choice {
-            StartChoice::Template(index) => self.discard_then(AfterDiscard::Template(index)),
+            StartChoice::Template(id) => self.discard_then(AfterDiscard::Template(id)),
+            StartChoice::RemoveTemplate(index) => {
+                if let Some(template) = self.start.saved().get(index) {
+                    self.question = Some(Question::RemoveTemplate {
+                        name: template.name().to_owned(),
+                        path: template.path().to_owned(),
+                    });
+                }
+            }
             StartChoice::Open => self.perform(Action::Open),
             StartChoice::Back => self.screen = Screen::Editor,
             StartChoice::Restore => {
@@ -79,6 +87,12 @@ impl MindMapApp {
             ("Delete", Action::Delete, can_delete, "Delete"),
             ("Center", Action::CenterView, true, "Home"),
             (
+                "Save as template",
+                Action::SaveTemplate,
+                true,
+                "Add this map to the start screen's templates, named after its central idea",
+            ),
+            (
                 "Export",
                 Action::Export,
                 true,
@@ -103,6 +117,21 @@ impl MindMapApp {
                 can_fold,
                 "Space or click the +/- handle",
             ),
+            if self.view.focus().is_some() {
+                (
+                    "Show all",
+                    Action::ToggleFocus,
+                    true,
+                    "F6 or Esc: show the whole map again",
+                )
+            } else {
+                (
+                    "Focus",
+                    Action::ToggleFocus,
+                    self.selected.is_some_and(|id| id != root),
+                    "F6: show only the selected branch",
+                )
+            },
         ];
         ui.horizontal_wrapped(|ui| {
             for (label, action, enabled, hint) in buttons {

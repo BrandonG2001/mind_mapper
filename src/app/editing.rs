@@ -82,6 +82,7 @@ impl MindMapApp {
 
     pub(super) fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
         self.map = map;
+        self.view.set_focus(None);
         self.history = History::new(HISTORY_LIMITS);
         self.select(None);
         self.editing = None;
@@ -104,8 +105,10 @@ impl MindMapApp {
     pub(super) fn navigate(&mut self, direction: Direction) {
         let target = match self.selected {
             Some(from) => navigation::neighbor(&self.map, from, direction),
-            None => Some(self.map.root()),
-        };
+            None => Some(self.view.focus().unwrap_or_else(|| self.map.root())),
+        }
+        // In focus mode the arrows stay inside the focused branch.
+        .filter(|&id| self.is_in_focus(id));
         if target.is_some() {
             self.select(target);
             self.reveal = target;
@@ -113,6 +116,8 @@ impl MindMapApp {
     }
 
     pub(super) fn start_edit(&mut self, id: NodeId, buffer: String) {
+        // E.g. a sibling added next to the focused branch, outside it.
+        self.bring_into_focus(id);
         self.focus(id);
         self.editing = Some(EditSession {
             id,
@@ -152,6 +157,7 @@ impl MindMapApp {
                     .try_for_each(|&ancestor| map.set_collapsed(ancestor, false))
             });
         }
+        self.bring_into_focus(id);
         self.select(Some(id));
         self.reveal = Some(id);
     }

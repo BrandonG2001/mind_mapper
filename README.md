@@ -13,6 +13,8 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Template gallery**: start from Blank, Brainstorm, Project Plan, SWOT Analysis,
   Meeting Notes, Decision Making, Study Notes or Weekly Planner. Each card shows a live
   preview of its map.
+- **Your own templates**: Save as template adds any map to the gallery, named after its
+  central idea; right-click its card to remove it.
 - **Keyboard-first editing**: Tab adds a child, Enter adds a sibling, and you type the
   label straight away. The arrow keys move around the map.
 - **Drag to rearrange**: moving a node moves all of its descendants with it. Drop it onto
@@ -25,7 +27,12 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Collapse and expand branches** to keep large maps readable. Folded branches stay folded
   when the map is saved.
 - **Recent files** on the start screen for quick access to the maps you use most.
-- **Export** to a PNG image, an SVG drawing or a Markdown outline.
+- **Export** to a PNG image, an SVG drawing, a Markdown outline, an OPML outline or a
+  FreeMind map.
+- **Import** OPML outlines (from most outliners) and FreeMind / Freeplane `.mm` maps:
+  labels, notes, links, colours, folded branches and sides come across, then the map is
+  tidied.
+- **Focus mode**: F6 shows only the selected branch; Esc or F6 brings back the whole map.
 - **Find** any node by its text or notes; matches are highlighted and folded branches open
   as needed.
 - **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
@@ -98,7 +105,8 @@ mind_mapper path/to/ideas.json
 | Move a node and its branch | Drag it (with several selected, they all move) |
 | Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
 | Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
-| Colour, notes, rename, reorder or delete a node | Right-click it (colour and delete apply to every selected node) |
+| Colour, notes, rename, reorder, focus on or delete a node | Right-click it (colour and delete apply to every selected node) |
+| Remove one of your templates | Right-click its card on the start screen |
 | Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
@@ -117,18 +125,24 @@ mind_mapper path/to/ideas.json
 | Space | Collapse or expand the selected node's branch |
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
 | Alt+Up / Alt+Down | Swap the selected node (with its branch) with the sibling above / below it |
-| Ctrl+E | Export as PNG, SVG or Markdown (chosen by the file extension) |
+| Ctrl+E | Export as PNG, SVG, Markdown, OPML or FreeMind (chosen by the file extension) |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
+| Esc | Close the find bar, or leave focus mode |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
 | Ctrl+C / Ctrl+X | Copy / cut the selected branches (or copy the whole map) as an indented outline |
 | Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
-| Ctrl+O | Open a map |
+| Ctrl+O | Open a map, or import an OPML (`.opml`) or FreeMind (`.mm`) file |
+| F6 | Focus mode: show only the selected branch, or the whole map again |
 | Ctrl+S / Ctrl+Shift+S | Save / save as |
 
 While renaming, Enter keeps the new label, Shift+Enter starts a new line and Esc cancels.
 On the template gallery, Esc returns to the map you were editing.
+
+An imported OPML or FreeMind file opens as a new, unsaved map: Save asks where to keep it as
+a mind-map file, so the original is never overwritten. OPML has no colours, folded state or
+sides, so those come from FreeMind files only; neither format keeps node positions.
 
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
 work is discarded by opening another map, choosing a template or closing the window. If
@@ -173,8 +187,9 @@ single tree, is rejected with an error message rather than partially loaded.
 Saving writes to a temporary file first and then swaps it into place, so a crash or full
 disk mid-save leaves the previous version intact.
 
-Settings (`settings.json`: theme, interface size and recent files), the window size and the
-crash-recovery copies live in the app's data folder. Settings are shared safely between
+Settings (`settings.json`: theme, interface size and recent files), the window size, your
+templates (one map file each in `templates/`) and the crash-recovery copies live in the
+app's data folder. Settings are shared safely between
 open windows: each change is merged into the file rather than overwriting it.
 
 | OS | Folder |
@@ -224,10 +239,12 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/storage.rs`](src/storage.rs) | JSON load and save, atomic file writes |
 | [`src/recovery.rs`](src/recovery.rs) | Background copy of unsaved work for crash recovery |
 | [`src/templates.rs`](src/templates.rs) | Built-in templates |
-| [`src/layout.rs`](src/layout.rs) | Automatic, overlap-free layout (Tidy up, templates) |
+| [`src/user_templates.rs`](src/user_templates.rs) | Templates saved by the user, in the data folder |
+| [`src/formats.rs`](src/formats.rs) | OPML ([`opml.rs`](src/formats/opml.rs)) and FreeMind ([`freemind.rs`](src/formats/freemind.rs)) import and export |
+| [`src/layout.rs`](src/layout.rs) | Automatic, overlap-free layout (Tidy up, templates, imports) |
 | [`src/recent.rs`](src/recent.rs) | The recent-files list |
 | [`src/navigation.rs`](src/navigation.rs) | Arrow-key movement between nodes |
-| [`src/export.rs`](src/export.rs) | PNG, SVG and Markdown export |
+| [`src/export.rs`](src/export.rs) | PNG, SVG, Markdown, OPML and FreeMind export |
 | [`src/search.rs`](src/search.rs) | The find bar and node matching |
 | [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
 | [`src/details.rs`](src/details.rs) | Side panel for colour, notes and link |
@@ -235,13 +252,14 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/icon.rs`](src/icon.rs) | The window icon, drawn from `assets/icon.svg` |
 | [`build.rs`](build.rs) | Embeds `assets/icon.ico` in the Windows executable |
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |
-| [`src/start_screen.rs`](src/start_screen.rs) | The template gallery |
+| [`src/start_screen.rs`](src/start_screen.rs) | The template gallery (built-in and your own) |
 | [`src/theme.rs`](src/theme.rs) | Colour themes and saving the chosen one |
 | [`src/app.rs`](src/app.rs) | App state, actions and keyboard shortcuts |
 | [`src/app/canvas.rs`](src/app/canvas.rs) | Map canvas: mouse, inline label editor, right-click menu |
 | [`src/app/editing.rs`](src/app/editing.rs) | Undoable edits, folding, navigation, clipboard |
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
-| [`src/app/files.rs`](src/app/files.rs) | Open, save (with the overwrite check), export, settings |
+| [`src/app/files.rs`](src/app/files.rs) | Open and import, save (with the overwrite check), export, templates, settings |
+| [`src/app/focus.rs`](src/app/focus.rs) | Focus mode: one branch on its own |
 | [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
 | [`src/app/selection.rs`](src/app/selection.rs) | Multi-select, and the edits that act on every selected node |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |

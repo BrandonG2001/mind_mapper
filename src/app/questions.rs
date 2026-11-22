@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, ViewportCommand};
 
 use super::{MindMapApp, file_label};
+use crate::start_screen::TemplateId;
 
 /// Widest a question's text gets before it wraps, in points.
 const MAX_WIDTH: f32 = 380.0;
@@ -25,6 +26,13 @@ pub(super) enum Question {
     Discard(AfterDiscard),
     /// Saving to this path would replace changes made there by another window or program.
     Overwrite(PathBuf),
+    /// Delete the user's template called `name`, stored at `path`.
+    RemoveTemplate {
+        /// The template's name, as shown on its card.
+        name: String,
+        /// Its file.
+        path: PathBuf,
+    },
 }
 
 /// What to do once the user agrees to throw away unsaved work.
@@ -36,8 +44,8 @@ pub(super) enum AfterDiscard {
     PickFile,
     /// Open this map file.
     OpenPath(PathBuf),
-    /// Start from the start screen's template at this index.
-    Template(usize),
+    /// Start from this template.
+    Template(TemplateId),
 }
 
 impl Question {
@@ -58,6 +66,14 @@ impl Question {
                     file_label(path)
                 )),
                 "Replace",
+            ),
+            Self::RemoveTemplate { name, .. } => (
+                "Remove template",
+                Cow::Owned(format!(
+                    "Remove \"{name}\" from your templates? Maps already started from it \
+                     are not affected."
+                )),
+                "Remove",
             ),
         }
     }
@@ -102,7 +118,8 @@ impl MindMapApp {
                     file_label(&path)
                 );
             }
-            (Question::Discard(_), false) => {}
+            (Question::RemoveTemplate { name, path }, true) => self.remove_template(&name, &path),
+            (Question::Discard(_) | Question::RemoveTemplate { .. }, false) => {}
         }
     }
 
@@ -116,7 +133,7 @@ impl MindMapApp {
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             AfterDiscard::PickFile => {
-                if let Some(path) = super::files::file_dialog().pick_file() {
+                if let Some(path) = super::files::open_dialog().pick_file() {
                     self.open_path(&path);
                 }
             }

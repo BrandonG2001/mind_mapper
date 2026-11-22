@@ -1911,6 +1911,7 @@ dependencies = [
  "epaint_default_fonts",
  "resvg",
  "rfd",
+ "roxmltree",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

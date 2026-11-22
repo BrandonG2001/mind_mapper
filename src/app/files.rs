@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use rfd::FileDialog;
 
 use super::questions::Question;
-use super::{FILE_FILTER, MindMapApp, file_label};
+use super::{FILE_FILTER, IMPORT_FILTERS, MindMapApp, file_label};
 use crate::background::Job;
 use crate::export::{self, ExportStyle};
+use crate::formats::{self, Format};
 use crate::settings::Settings;
 use crate::storage;
 
@@ -31,7 +32,12 @@ impl MindMapApp {
         }
     }
 
+    /// Open the map file at `path`, or import it if it is in another app's format.
     pub(super) fn open_path(&mut self, path: &Path) {
+        if let Some(format) = Format::from_path(path) {
+            self.import_path(path, format);
+            return;
+        }
         match storage::load_from_path(path) {
             Ok((map, stamp)) => {
                 self.status = format!("Opened {}", file_label(path));
@@ -42,6 +48,23 @@ impl MindMapApp {
             Err(err) => {
                 self.status = format!("Could not open {}: {err}", path.display());
                 // Drop dead entries (moved or deleted files) from the recent list.
+                self.update_settings(|settings| settings.recent.remove(path));
+            }
+        }
+    }
+
+    /// Open `path`, an OPML or FreeMind file, as a new map that is not linked to any file
+    /// yet (saving asks where to keep it as a mind-map file, so the original is never
+    /// overwritten with this app's format).
+    fn import_path(&mut self, path: &Path, format: Format) {
+        match formats::import(path, format) {
+            Ok(map) => {
+                self.update_settings(|settings| settings.recent.add(path));
+                self.replace_map(map, None);
+                self.status = format!("Imported {}; Save keeps it as a mind map", file_label(path));
+            }
+            Err(err) => {
+                self.status = format!("Could not import {}: {err}", path.display());
                 self.update_settings(|settings| settings.recent.remove(path));
             }
         }
@@ -89,6 +112,43 @@ impl MindMapApp {
             .is_some_and(|on_disk| self.file_stamp != Some(on_disk))
     }
 
+    /// Save the map as one of the user's templates, named after its central idea.
+    pub(super) fn save_as_template(&mut self) {
+        let Some(folder) = &self.template_folder else {
+            "Templates cannot be saved: the app's data folder is unavailable"
+                .clone_into(&mut self.status);
+            return;
+        };
+        self.status = match folder.save(&self.map) {
+            Ok(saved) if saved.replaced => format!("Replaced the template \"{}\"", saved.name),
+            Ok(saved) => format!(
+                "Saved \"{}\" as a template; New shows it on the start screen",
+                saved.name
+            ),
+            Err(err) => format!("Could not save the template: {err}"),
+        };
+        self.reload_templates();
+    }
+
+    /// Delete the user's template stored at `path`, then refresh the start screen.
+    pub(super) fn remove_template(&mut self, name: &str, path: &Path) {
+        let Some(folder) = &self.template_folder else {
+            return;
+        };
+        self.status = match folder.remove(path) {
+            Ok(()) => format!("Removed the template \"{name}\""),
+            Err(err) => format!("Could not remove the template: {err}"),
+        };
+        self.reload_templates();
+    }
+
+    /// Show the templates currently in the templates folder on the start screen.
+    pub(super) fn reload_templates(&mut self) {
+        if let Some(folder) = &self.template_folder {
+            self.start.set_saved(folder.load());
+        }
+    }
+
     /// Ask where to export, then export there.
     pub(super) fn export_dialog(&mut self) {
         let stem = self
@@ -100,6 +160,8 @@ impl MindMapApp {
             .add_filter("PNG image", &["png"])
             .add_filter("SVG drawing", &["svg"])
             .add_filter("Markdown outline", &["md"])
+            .add_filter(IMPORT_FILTERS[0].0, IMPORT_FILTERS[0].1)
+            .add_filter(IMPORT_FILTERS[1].0, IMPORT_FILTERS[1].1)
             .set_file_name(format!("{stem}.png"));
         if let Some(path) = dialog.save_file() {
             self.export_to(&path);
@@ -123,7 +185,20 @@ impl MindMapApp {
     }
 }
 
-/// A file dialog pre-configured for mind-map files.
+/// A file dialog pre-configured for saving mind-map files.
 pub(super) fn file_dialog() -> FileDialog {
     FileDialog::new().add_filter(FILE_FILTER.0, FILE_FILTER.1)
+}
+
+/// A file dialog for opening: mind maps, plus the formats that can be imported.
+pub(super) fn open_dialog() -> FileDialog {
+    let all: Vec<&str> = std::iter::once(FILE_FILTER)
+        .chain(IMPORT_FILTERS)
+        .flat_map(|(_, extensions)| extensions.iter().copied())
+        .collect();
+    // The first filter is the one selected when the dialog opens.
+    std::iter::once(FILE_FILTER).chain(IMPORT_FILTERS).fold(
+        FileDialog::new().add_filter("Mind maps and outlines", &all),
+        |dialog, (name, extensions)| dialog.add_filter(name, extensions),
+    )
 }

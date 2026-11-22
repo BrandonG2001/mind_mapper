@@ -27,6 +27,7 @@ pub mod camera;
 pub mod clipboard;
 pub mod details;
 pub mod export;
+pub mod formats;
 pub mod history;
 pub mod icon;
 pub mod layout;
@@ -41,6 +42,7 @@ pub mod start_screen;
 pub mod storage;
 pub mod templates;
 pub mod theme;
+pub mod user_templates;
 
 #[cfg(test)]
 mod test_support;

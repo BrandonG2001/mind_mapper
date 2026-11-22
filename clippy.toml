@@ -1,0 +1,2 @@
+# Product names that appear in doc comments; ".." keeps clippy's built-in list.
+doc-valid-idents = ["FreeMind", "OmniOutliner", ".."]

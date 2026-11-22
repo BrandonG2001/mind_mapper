@@ -373,10 +373,28 @@ impl MindMap {
         self.walk(self.root, true)
     }
 
+    /// Like [`MindMap::visible_preorder`], but only `start` and the visible part of its
+    /// branch.
+    pub fn visible_subtree_preorder(&self, start: NodeId) -> impl Iterator<Item = Visit<'_>> {
+        self.walk(start, true)
+    }
+
+    /// Index among the root's children of the top-level branch that contains `id`
+    /// (`None` for the root itself, or a node that does not exist).
+    pub(crate) fn branch_index(&self, id: NodeId) -> Option<usize> {
+        let top = std::iter::once(id)
+            .chain(self.ancestors(id))
+            .find(|&node| self.node(node).and_then(|node| node.parent) == Some(self.root))?;
+        self.node(self.root)?
+            .children
+            .iter()
+            .position(|&child| child == top)
+    }
+
     fn walk(&self, start: NodeId, skip_collapsed: bool) -> impl Iterator<Item = Visit<'_>> {
         // An explicit stack instead of recursion, so deep trees cannot overflow the
-        // call stack.
-        let mut stack = vec![(start, None)];
+        // call stack. A walk starting inside a branch still reports that branch's index.
+        let mut stack = vec![(start, self.branch_index(start))];
         std::iter::from_fn(move || {
             let (id, branch) = stack.pop()?;
             let node = self.node(id)?;
@@ -1046,6 +1064,20 @@ mod tests {
         assert_eq!(map.swap_siblings(a, a), Err(MapError::NotSiblings));
         assert_eq!(map.swap_siblings(map.root(), b), Err(MapError::RootNode));
         assert_eq!(map, before);
+    }
+
+    #[test]
+    fn walks_inside_a_branch_report_its_index() {
+        let (map, a, b, a1) = sample_map();
+
+        let visits: Vec<(NodeId, Option<usize>)> = map
+            .visible_subtree_preorder(a)
+            .map(|visit| (visit.id, visit.branch))
+            .collect();
+
+        assert_eq!(visits, [(a, Some(0)), (a1, Some(0))]);
+        assert_eq!(map.branch_index(b), Some(1));
+        assert_eq!(map.branch_index(map.root()), None);
     }
 
     #[test]
