@@ -30,6 +30,7 @@ mod canvas;
 mod editing;
 mod files;
 mod focus;
+mod help;
 mod links;
 mod outline;
 mod panels;
@@ -89,6 +90,8 @@ enum Action {
     /// Swap the selected node with its sibling above (`Up`) or below (`Down`).
     Reorder(Direction),
     Export,
+    /// Export just the selected branch.
+    ExportBranch,
     /// Save the map as one of the user's templates on the start screen.
     SaveTemplate,
     Find,
@@ -105,6 +108,10 @@ enum Action {
     ToggleFocus,
     /// Show or hide the outline panel.
     ToggleOutline,
+    /// Show or hide the shortcut overview.
+    ToggleHelp,
+    /// Make the selected nodes bold, or not.
+    ToggleBold,
 }
 
 /// A clipboard request, which egui reports as an event rather than a key press.
@@ -119,7 +126,11 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 30] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 33] = [
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E),
+        Action::ExportBranch,
+    ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O),
         Action::ToggleOutline,
@@ -218,8 +229,16 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 30] = [
         Action::ToggleFocus,
     ),
     (
+        KeyboardShortcut::new(Modifiers::NONE, Key::F1),
+        Action::ToggleHelp,
+    ),
+    (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::K),
         Action::StartLink,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::B),
+        Action::ToggleBold,
     ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::E),
@@ -319,6 +338,8 @@ pub struct MindMapApp {
     label_edit: Option<links::LabelEdit>,
     /// The outline panel, while it is open.
     outline: Option<outline::Outline>,
+    /// The shortcut overview, while it is open.
+    help: Option<help::Help>,
     /// A question shown over the window, waiting for the user's answer.
     question: Option<Question>,
     /// The map changed since the last recovery copy was written.
@@ -440,6 +461,7 @@ impl MindMapApp {
             linking: None,
             label_edit: None,
             outline: None,
+            help: None,
             template_folder: None,
             updates: updates::Updates::default(),
             file_autosave: autosave::FileAutoSave::default(),
@@ -472,7 +494,6 @@ impl MindMapApp {
         // Any toolbar or keyboard action first finishes in-progress edits.
         self.commit_edit();
         self.flush_details();
-        let root = self.map.root();
         match action {
             Action::New => {
                 // Pick up files and templates other windows saved since this one started.
@@ -505,28 +526,8 @@ impl MindMapApp {
                     self.after_history_change();
                 }
             }
-            Action::AddChild => {
-                let parent = self.selected.unwrap_or(root);
-                let created = self.edit_map(|map| {
-                    // A new child inside a folded branch would be invisible; unfold it.
-                    if map.node(parent).is_some_and(Node::is_collapsed) {
-                        map.set_collapsed(parent, false)?;
-                    }
-                    map.add_child(parent, NEW_NODE_TEXT)
-                });
-                if let Some(id) = created {
-                    self.start_edit(id, String::new());
-                }
-            }
-            Action::AddSibling => {
-                let created = match self.selected.filter(|&id| id != root) {
-                    Some(sibling) => self.edit_map(|map| map.add_sibling(sibling, NEW_NODE_TEXT)),
-                    None => self.edit_map(|map| map.add_child(root, NEW_NODE_TEXT)),
-                };
-                if let Some(id) = created {
-                    self.start_edit(id, String::new());
-                }
-            }
+            Action::AddChild => self.add_node(false),
+            Action::AddSibling => self.add_node(true),
             Action::Rename => {
                 if let Some(id) = self.selected
                     && let Some(node) = self.map.node(id)
@@ -545,7 +546,14 @@ impl MindMapApp {
                     self.toggle_collapse(id);
                 }
             }
-            Action::Export => self.export_dialog(),
+            Action::Export => self.export_dialog(None),
+            Action::ExportBranch => {
+                if let Some(id) = self.selected {
+                    self.export_dialog(Some(id));
+                } else {
+                    "Select the branch to export first".clone_into(&mut self.status);
+                }
+            }
             Action::SaveTemplate => self.save_as_template(),
             Action::Navigate(direction) => self.navigate(direction),
             Action::Reorder(direction) => self.reorder(direction),
@@ -557,18 +565,47 @@ impl MindMapApp {
             Action::FindNext => self.search_command(SearchCommand::Next),
             Action::FindPrevious => self.search_command(SearchCommand::Previous),
             Action::Dismiss => {
-                if !self.cancel_link() && self.search.take().is_none() {
+                if !self.cancel_link() && self.help.take().is_none() && self.search.take().is_none()
+                {
                     self.leave_focus();
                 }
             }
             Action::StartLink => self.start_link(),
             Action::ToggleFocus => self.toggle_focus(),
             Action::ToggleOutline => self.toggle_outline(),
+            Action::ToggleHelp => self.toggle_help(),
+            Action::ToggleBold => self.toggle_bold(),
             Action::ToggleDetails => {
                 if self.details.take().is_none() {
                     self.details = Some(DetailsPanel::default());
                 }
             }
+        }
+    }
+
+    /// Add a new node to edit straight away: a child of the selected node (or of the
+    /// central idea), or with `sibling`, a sibling of it (a child of the central idea if
+    /// that is selected or nothing is).
+    fn add_node(&mut self, sibling: bool) {
+        let root = self.map.root();
+        let created = match (sibling, self.selected) {
+            (true, Some(id)) if id != root => {
+                self.edit_map(|map| map.add_sibling(id, NEW_NODE_TEXT))
+            }
+            (true, _) => self.edit_map(|map| map.add_child(root, NEW_NODE_TEXT)),
+            (false, selected) => {
+                let parent = selected.unwrap_or(root);
+                self.edit_map(|map| {
+                    // A new child inside a folded branch would be invisible; unfold it.
+                    if map.node(parent).is_some_and(Node::is_collapsed) {
+                        map.set_collapsed(parent, false)?;
+                    }
+                    map.add_child(parent, NEW_NODE_TEXT)
+                })
+            }
+        };
+        if let Some(id) = created {
+            self.start_edit(id, String::new());
         }
     }
 
@@ -688,10 +725,13 @@ fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
 
 impl eframe::App for MindMapApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Before any text is laid out this frame (a no-op after the first frame).
+        crate::fonts::install(ui.ctx());
         self.handle_window(ui);
         // Before the panels, so they already ignore clicks while a question is open.
         self.show_question(ui.ctx());
         self.show_label_editor(ui.ctx());
+        self.show_help(ui.ctx());
         self.poll_jobs();
         self.autosave(ui.ctx());
         self.handle_shortcuts(ui);

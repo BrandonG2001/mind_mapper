@@ -58,6 +58,11 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Multi-line labels**: press Shift+Enter while editing to start a new line.
 - **Colours, notes and links**: give any branch its own colour, and attach notes or a web
   link to a node (shown with a folded corner and on hover).
+- **Text styles**: bold (Ctrl+B), italic and two larger sizes for any label, on the canvas
+  and in exports.
+- **Export one branch** (Ctrl+Shift+E or the right-click menu) in any export format, in the
+  colours it has on the map.
+- **Shortcut overview**: F1 lists every keyboard shortcut and mouse action.
 - **Plain JSON files** that are easy to back up, diff or generate with other tools.
 - **Safe saving and crash recovery**: saves never leave a half-written file, and unsaved
   work is backed up in the background so it can be restored after a crash.
@@ -121,7 +126,7 @@ mind_mapper path/to/ideas.json
 | Move a node and its branch | Drag it (with several selected, they all move) |
 | Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
 | Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
-| Colour, notes, rename, reorder, focus on or delete a node | Right-click it (colour and delete apply to every selected node) |
+| Colour, text style, notes, rename, reorder, focus on, export or delete a node | Right-click it (colour, style and delete apply to every selected node) |
 | Remove one of your templates | Right-click its card on the start screen |
 | Link two nodes | Right-click the first, choose **Link to...**, then click the second (Esc cancels) |
 | Label or remove a link | Right-click either node and choose **Label link ...** or **Remove link ...** |
@@ -147,6 +152,9 @@ mind_mapper path/to/ideas.json
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
 | Alt+Up / Alt+Down | Swap the selected node (with its branch) with the sibling above / below it |
 | Ctrl+E | Export as PNG, SVG, PDF, Markdown, OPML or FreeMind (chosen by the file extension) |
+| Ctrl+Shift+E | Export just the selected branch |
+| Ctrl+B | Make the selected nodes bold, or plain again |
+| F1 | Show or hide the overview of every shortcut and mouse action |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
 | Esc | Cancel a link being made, close the find bar, or leave focus mode |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
@@ -204,10 +212,12 @@ parent by its position in the list:
 
 Optional fields appear only when used, so files from older versions load unchanged:
 `"collapsed": true` on a folded node, `"color": "#rrggbb"` for a chosen colour, `"note"`
-for notes, `"link"` for a web address and `"picture"` for a picture, stored as a data URL
-(`"data:image/png;base64,..."`, at most 8 MB). Cross-links are listed after the nodes, by
-node position, as `"links": [{ "from": 6, "to": 1, "label": "depends on" }]`. Versions
-before 0.9 ignore links, and before 0.10 pictures and link labels.
+for notes, `"link"` for a web address, `"picture"` for a picture, stored as a data URL
+(`"data:image/png;base64,..."`, at most 8 MB), and `"style": { "bold": true, "italic": true,
+"size": "large" }` (or `"larger"`) for a styled label. Cross-links are listed after the
+nodes, by node position, as `"links": [{ "from": 6, "to": 1, "label": "depends on" }]`.
+Versions before 0.9 ignore links, before 0.10 pictures and link labels, and before 1.0
+text styles.
 
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
@@ -278,6 +288,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/navigation.rs`](src/navigation.rs) | Arrow-key movement between nodes |
 | [`src/export.rs`](src/export.rs) | PNG, SVG, PDF, Markdown, OPML and FreeMind export |
 | [`src/picture.rs`](src/picture.rs) | Pictures on nodes: reading, storing and scaling them |
+| [`src/fonts.rs`](src/fonts.rs) | The label fonts, including the bundled bold font |
 | [`src/update.rs`](src/update.rs) | Asking GitHub for the latest release |
 | [`src/search.rs`](src/search.rs) | The find bar and node matching |
 | [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
@@ -294,6 +305,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
 | [`src/app/files.rs`](src/app/files.rs) | Open and import, save (with the overwrite check), export, templates, settings |
 | [`src/app/focus.rs`](src/app/focus.rs) | Focus mode: one branch on its own |
+| [`src/app/help.rs`](src/app/help.rs) | The shortcut overview (F1) |
 | [`src/app/links.rs`](src/app/links.rs) | Making, labelling and removing cross-links |
 | [`src/app/outline.rs`](src/app/outline.rs) | The outline view |
 | [`src/app/pictures.rs`](src/app/pictures.rs) | Adding pictures by file, paste or drag and drop |
@@ -344,6 +356,11 @@ Licensed under either of
 - MIT License ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
+
+The bundled bold font, [`assets/fonts/Ubuntu-Bold.ttf`](assets/fonts/Ubuntu-Bold.ttf), is
+the Ubuntu font family's bold weight (the regular labels use its light weight, built into
+egui), distributed under the Ubuntu Font Licence 1.0 in
+[`assets/fonts/UFL.txt`](assets/fonts/UFL.txt).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed

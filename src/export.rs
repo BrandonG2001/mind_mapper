@@ -22,13 +22,14 @@ use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
 use crate::clipboard;
+use crate::fonts::UBUNTU_BOLD;
 use crate::formats::{Format, freemind, opml, push_escaped};
 use crate::map_view::{
     ARROW_SIZE, Accents, BASE_FONT_SIZE, LINE_HEIGHT, LINK_DASH, LINK_LABEL_SCALE, LINK_OPACITY,
     LINK_WIDTH, arrow_head, cross_link_curve, curve_midpoint, estimated_link_label_size,
     estimated_rect, node_contents, wrap_label,
 };
-use crate::model::{MindMap, NodeId};
+use crate::model::{MindMap, NodeId, NodeStyle};
 use crate::picture::{Picture, PictureFormat};
 use crate::storage::{StorageError, write_atomically};
 use crate::theme::ColorTheme;
@@ -43,6 +44,8 @@ const STROKE_WIDTH: f32 = 2.0;
 const PNG_SCALE: f32 = 2.0;
 /// Largest PNG width or height; bigger maps are scaled down to fit.
 const MAX_PNG_SIDE: f32 = 8192.0;
+/// How far italic labels lean: sideways movement per unit of height (about 11 degrees).
+const ITALIC_SLANT: f32 = 0.2;
 /// Largest PDF page side, in points; PDF readers commonly refuse anything bigger.
 const MAX_PDF_SIDE: f32 = 14_400.0;
 /// Fonts listed in exported SVGs; the first is egui's built-in label font.
@@ -186,6 +189,45 @@ struct SceneNode<'a> {
     picture: Option<(Rect, &'a Picture)>,
     /// Each line's horizontal centre and baseline, with its text.
     lines: Vec<(Pos2, &'a str)>,
+    /// How the label is written.
+    look: TextLook,
+}
+
+/// How a block of label text is written in an export.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextLook {
+    size: f32,
+    bold: bool,
+    italic: bool,
+}
+
+impl TextLook {
+    /// Regular text of font `size`.
+    const fn plain(size: f32) -> Self {
+        Self {
+            size,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    /// A node label in `style`.
+    const fn of(style: NodeStyle) -> Self {
+        Self {
+            size: BASE_FONT_SIZE * style.font_scale(),
+            bold: style.bold,
+            italic: style.italic,
+        }
+    }
+
+    /// The sideways shear that slants italic text around the middle of `lines` (as
+    /// `(slant, shift)`: x moves by `shift - slant * y`), or `None` for upright text.
+    fn slant(self, lines: &[(Pos2, &str)]) -> Option<(f32, f32)> {
+        let (first, last) = (lines.first()?.0.y, lines.last()?.0.y);
+        // The middle of the text block: halfway between the baselines, raised to mid-letter.
+        let middle = f32::midpoint(first, last) - self.size * 0.35;
+        self.italic.then_some((ITALIC_SLANT, ITALIC_SLANT * middle))
+    }
 }
 
 impl<'a> Scene<'a> {
@@ -221,12 +263,14 @@ impl<'a> Scene<'a> {
             let rect = Rect::from_min_size(at(world_rect.min), world_rect.size());
             boxes[visit.id.index()] = Some(rect);
             let (picture_place, label_center) = node_contents(visit.node, rect);
-            let lines = centred_lines(visit.node.text(), label_center, BASE_FONT_SIZE);
+            let look = TextLook::of(visit.node.style());
+            let lines = centred_lines(visit.node.text(), label_center, look.size);
             nodes.push(SceneNode {
                 rect,
                 accent,
                 picture: picture_place.zip(visit.node.picture()),
                 lines,
+                look,
             });
         }
         let box_of = |id: NodeId| boxes.get(id.index()).copied().flatten();
@@ -327,7 +371,8 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
                 backing.height(),
                 hex(style.node_fill),
             )?;
-            write_text(out, lines, BASE_FONT_SIZE * LINK_LABEL_SCALE, style.text)?;
+            let look = TextLook::plain(BASE_FONT_SIZE * LINK_LABEL_SCALE);
+            write_text(out, lines, look, style.text)?;
         }
     }
     for node in &scene.nodes {
@@ -353,19 +398,32 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
                 picture.to_data_url(),
             )?;
         }
-        write_text(out, &node.lines, BASE_FONT_SIZE, style.text)?;
+        write_text(out, &node.lines, node.look, style.text)?;
     }
     out.push_str("</svg>\n");
     Ok(())
 }
 
 /// An SVG `<text>` element with one centred `<tspan>` per line.
-fn write_text(out: &mut String, lines: &[(Pos2, &str)], size: f32, color: Color32) -> fmt::Result {
+fn write_text(
+    out: &mut String,
+    lines: &[(Pos2, &str)],
+    look: TextLook,
+    color: Color32,
+) -> fmt::Result {
     write!(
         out,
-        r#"<text font-family="{FONT_FAMILY}" font-size="{size}" fill="{}" text-anchor="middle">"#,
+        r#"<text font-family="{FONT_FAMILY}" font-size="{}" fill="{}" text-anchor="middle""#,
+        look.size,
         hex(color)
     )?;
+    if look.bold {
+        out.push_str(r#" font-weight="bold""#);
+    }
+    if let Some((slant, shift)) = look.slant(lines) {
+        write!(out, r#" transform="matrix(1 0 {} 1 {shift:.2} 0)""#, -slant)?;
+    }
+    out.push('>');
     for &(anchor, line) in lines {
         write!(out, r#"<tspan x="{:.1}" y="{:.1}">"#, anchor.x, anchor.y)?;
         push_escaped(out, line);
@@ -393,11 +451,8 @@ fn curve_data([start, first, second, end]: [Pos2; 4]) -> String {
 pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
     let style = ExportStyle::from_visuals(&ColorTheme::Light.visuals());
     let scene = Scene::new(map, style.text);
-    let font_bytes = epaint_default_fonts::UBUNTU_LIGHT;
-    let font = Font::new(font_bytes.into(), 0)
-        .ok_or_else(|| ExportError::Render("the built-in font could not be read".to_owned()))?;
-    let face = ttf_parser::Face::parse(font_bytes, 0)
-        .map_err(|err| ExportError::Render(err.to_string()))?;
+    let regular = PdfFont::new(epaint_default_fonts::UBUNTU_LIGHT)?;
+    let bold = PdfFont::new(UBUNTU_BOLD)?;
     // Many PDF readers refuse pages larger than this, so huge maps are scaled down.
     let scale = (MAX_PDF_SIDE / scene.size.x.max(scene.size.y)).min(1.0);
     let page_settings = PageSettings::from_wh(scene.size.x * scale, scene.size.y * scale)
@@ -437,8 +492,8 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
         );
     }
     let text = PdfText {
-        font: &font,
-        face: &face,
+        regular: &regular,
+        bold: &bold,
     };
     for link in &scene.links {
         draw_cross_link(&mut surface, link.curve, style.text);
@@ -449,7 +504,11 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
                 surface.draw_path(&path);
             }
             surface.set_fill(Some(pdf_fill(style.text)));
-            text.draw(&mut surface, lines, BASE_FONT_SIZE * LINK_LABEL_SCALE);
+            text.draw(
+                &mut surface,
+                lines,
+                TextLook::plain(BASE_FONT_SIZE * LINK_LABEL_SCALE),
+            );
         }
     }
     for node in &scene.nodes {
@@ -464,7 +523,7 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
         }
         surface.set_stroke(None);
         surface.set_fill(Some(pdf_fill(style.text)));
-        text.draw(&mut surface, &node.lines, BASE_FONT_SIZE);
+        text.draw(&mut surface, &node.lines, node.look);
     }
     surface.pop();
     surface.finish();
@@ -474,28 +533,62 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
         .map_err(|err| ExportError::Render(format!("{err:?}")))
 }
 
-/// The embedded label font, for drawing text into a PDF.
+/// A font embedded in a PDF, with the same font read for measuring.
+struct PdfFont {
+    font: Font,
+    face: ttf_parser::Face<'static>,
+}
+
+impl PdfFont {
+    /// Read the font file `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError::Render` if the font cannot be read.
+    fn new(bytes: &'static [u8]) -> Result<Self, ExportError> {
+        let font = Font::new(bytes.into(), 0)
+            .ok_or_else(|| ExportError::Render("a built-in font could not be read".to_owned()))?;
+        let face = ttf_parser::Face::parse(bytes, 0)
+            .map_err(|err| ExportError::Render(err.to_string()))?;
+        Ok(Self { font, face })
+    }
+}
+
+/// The embedded label fonts, for drawing text into a PDF.
 struct PdfText<'a> {
-    font: &'a Font,
-    face: &'a ttf_parser::Face<'a>,
+    regular: &'a PdfFont,
+    bold: &'a PdfFont,
 }
 
 impl PdfText<'_> {
-    /// Draw `lines` (each centred on its anchor's x, on its baseline) at font `size`, in
+    /// Draw `lines` (each centred on its anchor's x, on its baseline) as `look` says, in
     /// the surface's current fill.
-    fn draw(&self, surface: &mut krilla::surface::Surface<'_>, lines: &[(Pos2, &str)], size: f32) {
+    fn draw(
+        &self,
+        surface: &mut krilla::surface::Surface<'_>,
+        lines: &[(Pos2, &str)],
+        look: TextLook,
+    ) {
+        let font = if look.bold { self.bold } else { self.regular };
+        let slant = look.slant(lines);
+        if let Some((slant, shift)) = slant {
+            surface.push_transform(&Transform::from_row(1.0, 0.0, -slant, 1.0, shift, 0.0));
+        }
         surface.set_stroke(None);
         for &(anchor, line) in lines {
-            let glyphs = line_glyphs(self.face, line);
+            let glyphs = line_glyphs(&font.face, line);
             let width: f32 = glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>();
             surface.draw_glyphs(
-                KrillaPoint::from_xy(anchor.x - width * size * 0.5, anchor.y),
+                KrillaPoint::from_xy(anchor.x - width * look.size * 0.5, anchor.y),
                 &glyphs,
-                self.font.clone(),
+                font.font.clone(),
                 line,
-                size,
+                look.size,
                 false,
             );
+        }
+        if slant.is_some() {
+            surface.pop();
         }
     }
 }
@@ -671,7 +764,9 @@ pub fn to_png(map: &MindMap, style: ExportStyle) -> Result<Vec<u8>, ExportError>
     // `Arc::make_mut` gives mutable access to the freshly created font database.
     let fonts = Arc::make_mut(&mut options.fontdb);
     fonts.load_font_data(epaint_default_fonts::UBUNTU_LIGHT.to_vec());
-    // Make that font the one SVG's generic `sans-serif` resolves to.
+    // Same family ("Ubuntu"), bold weight: picked for labels written in bold.
+    fonts.load_font_data(UBUNTU_BOLD.to_vec());
+    // Make the first (light) face's family the one SVG's generic `sans-serif` resolves to.
     let family = fonts
         .faces()
         .next()

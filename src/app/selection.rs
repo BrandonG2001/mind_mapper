@@ -5,7 +5,8 @@
 //! (`also_selected`). Dragging, colouring, deleting and copying act on all of them.
 
 use super::MindMapApp;
-use crate::model::{NodeColor, NodeId};
+use crate::details::StyleChange;
+use crate::model::{MapError, NodeColor, NodeId};
 use crate::navigation::{self, Direction};
 
 impl MindMapApp {
@@ -150,6 +151,32 @@ impl MindMapApp {
         if let Some(panel) = &mut self.details {
             panel.follow(&self.map, panel.node());
         }
+    }
+
+    /// Make one style change (bold, italic or size) to every selected node, as one undo
+    /// step.
+    pub(super) fn style_selection(&mut self, change: StyleChange) {
+        // Text typed in the side panel is saved first, so reloading it below loses nothing.
+        self.flush_details();
+        let targets: Vec<NodeId> = self.selection().collect();
+        self.edit_map(|map| {
+            targets.iter().try_for_each(|&id| {
+                let style = map.node(id).ok_or(MapError::NodeNotFound(id))?.style();
+                map.set_style(id, change.apply(style))
+            })
+        });
+        if let Some(panel) = &mut self.details {
+            panel.follow(&self.map, panel.node());
+        }
+    }
+
+    /// Ctrl+B: make the selected nodes bold, or plain again if the main one is bold.
+    pub(super) fn toggle_bold(&mut self) {
+        let Some(main) = self.selected.and_then(|id| self.map.node(id)) else {
+            return;
+        };
+        let bold = !main.style().bold;
+        self.style_selection(StyleChange::Bold(bold));
     }
 
     /// Alt+Up/Down: swap the main node (with its branch) with the sibling above or below

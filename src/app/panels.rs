@@ -100,6 +100,12 @@ impl MindMapApp {
             ),
             ("Find", Action::Find, true, "Ctrl+F"),
             (
+                "Help",
+                Action::ToggleHelp,
+                true,
+                "F1: keyboard shortcuts and mouse actions",
+            ),
+            (
                 "Outline",
                 Action::ToggleOutline,
                 true,
@@ -240,6 +246,9 @@ impl MindMapApp {
             }
             if let Some(color) = outcome.color {
                 self.color_selection(color);
+            }
+            if let Some(change) = outcome.style {
+                self.style_selection(change);
             }
         }
         if let Some(address) = outcome.open_link {

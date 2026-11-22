@@ -27,6 +27,7 @@ pub mod camera;
 pub mod clipboard;
 pub mod details;
 pub mod export;
+pub mod fonts;
 pub mod formats;
 pub mod history;
 pub mod icon;

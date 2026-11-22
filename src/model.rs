@@ -65,6 +65,8 @@ pub struct Node {
     link: Option<String>,
     /// A picture shown above the label.
     picture: Option<Picture>,
+    /// How the label is written: bold, italic, size.
+    style: NodeStyle,
 }
 
 impl Node {
@@ -80,7 +82,94 @@ impl Node {
             note: String::new(),
             link: None,
             picture: None,
+            style: NodeStyle::default(),
         }
+    }
+}
+
+/// How big a label is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextSize {
+    /// The usual size.
+    #[default]
+    Normal,
+    /// About a third bigger.
+    Large,
+    /// About two thirds bigger.
+    Larger,
+}
+
+impl TextSize {
+    /// Every size, smallest first.
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Large, Self::Larger];
+
+    /// The font size relative to a normal label.
+    #[must_use]
+    pub const fn scale(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::Large => 1.3,
+            Self::Larger => 1.65,
+        }
+    }
+
+    /// The size's name, as shown in menus.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Large => "Large",
+            Self::Larger => "Larger",
+        }
+    }
+
+    /// `serde` helper: skip writing the usual size.
+    // serde passes the field by reference, so this cannot take `self` by value.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
+
+/// How a node's label is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+// Missing fields take their default, so a style with only `"bold": true` loads.
+#[serde(default)]
+pub struct NodeStyle {
+    /// Written in the bold font.
+    #[serde(skip_serializing_if = "is_false")]
+    pub bold: bool,
+    /// Written slanted.
+    #[serde(skip_serializing_if = "is_false")]
+    pub italic: bool,
+    /// How big.
+    #[serde(skip_serializing_if = "TextSize::is_normal")]
+    pub size: TextSize,
+}
+
+/// How much wider bold text is than regular text (measured: 7% to 10%).
+const BOLD_WIDTH: f32 = 1.1;
+
+impl NodeStyle {
+    /// Whether this is the usual style (nothing to save).
+    // serde passes the field by reference, so this cannot take `self` by value.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The font size relative to a normal label.
+    #[must_use]
+    pub const fn font_scale(self) -> f32 {
+        self.size.scale()
+    }
+
+    /// How much wider the label is than a normal one with the same text.
+    #[must_use]
+    pub fn width_scale(self) -> f32 {
+        self.size.scale() * if self.bold { BOLD_WIDTH } else { 1.0 }
     }
 }
 
@@ -187,6 +276,12 @@ impl Node {
     pub const fn picture(&self) -> Option<&Picture> {
         self.picture.as_ref()
     }
+
+    /// How the label is written.
+    #[must_use]
+    pub const fn style(&self) -> NodeStyle {
+        self.style
+    }
 }
 
 /// Errors produced by operations on a [`MindMap`].
@@ -272,6 +367,9 @@ pub struct NodeRecord {
     /// The node's picture as a data URL (`data:image/png;base64,...`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    /// How the label is written; omitted for the usual style.
+    #[serde(default, skip_serializing_if = "NodeStyle::is_plain")]
+    pub style: NodeStyle,
 }
 
 /// Flat, serializable form of a cross-link: indices into the node records.
@@ -703,6 +801,16 @@ impl MindMap {
         Ok(())
     }
 
+    /// Write a node's label in `style`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_style(&mut self, id: NodeId, style: NodeStyle) -> Result<(), MapError> {
+        self.node_mut(id)?.style = style;
+        Ok(())
+    }
+
     /// Show `picture` on a node, or remove its picture with `None`.
     ///
     /// # Errors
@@ -1013,12 +1121,30 @@ impl MindMap {
     /// Flatten the whole map, nodes and cross-links, into records for saving.
     #[must_use]
     pub fn to_map_records(&self) -> MapRecords {
+        self.records_from(self.root)
+    }
+
+    /// A new map holding a copy of `id`'s branch, with `id` as its central idea: every
+    /// descendant with its details, and the cross-links between nodes of the branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn branch_copy(&self, id: NodeId) -> Result<Self, MapError> {
+        self.node(id).ok_or(MapError::NodeNotFound(id))?;
+        Self::from_map_records(self.records_from(id))
+    }
+
+    /// Flatten the branch of `start` (the whole map for the root) into records, with
+    /// `start` as the first, parentless record. Links leaving the branch are left out.
+    fn records_from(&self, start: NodeId) -> MapRecords {
         let mut index_of = vec![usize::MAX; self.slots.len()];
-        let mut records = Vec::with_capacity(self.len());
-        for visit in self.preorder() {
+        let mut records = Vec::new();
+        for visit in self.subtree_preorder(start) {
             index_of[visit.id.0] = records.len();
+            let parent = visit.node.parent.filter(|_| visit.id != start);
             records.push(NodeRecord {
-                parent: visit.node.parent.map(|parent| index_of[parent.0]),
+                parent: parent.map(|parent| index_of[parent.0]),
                 text: visit.node.text.clone(),
                 position: visit.node.position,
                 collapsed: visit.node.collapsed,
@@ -1026,15 +1152,19 @@ impl MindMap {
                 note: visit.node.note.clone(),
                 link: visit.node.link.clone(),
                 picture: visit.node.picture.as_ref().map(Picture::to_data_url),
+                style: visit.node.style,
             });
         }
+        let inside = |id: NodeId| Some(index_of[id.0]).filter(|&index| index != usize::MAX);
         let links = self
             .links
             .iter()
-            .map(|link| LinkRecord {
-                from: index_of[link.from.0],
-                to: index_of[link.to.0],
-                label: link.label.clone(),
+            .filter_map(|link| {
+                Some(LinkRecord {
+                    from: inside(link.from)?,
+                    to: inside(link.to)?,
+                    label: link.label.clone(),
+                })
             })
             .collect();
         MapRecords {
@@ -1097,6 +1227,7 @@ impl MindMap {
                 .map_err(|_| MapError::InvalidPicture { index })?;
             slots.push(Some(Node {
                 picture,
+                style: record.style,
                 collapsed: record.collapsed,
                 color: record.color,
                 note: record.note,
@@ -1437,6 +1568,55 @@ mod tests {
         );
         map.set_picture(a, None).expect("a exists");
         assert_eq!(map.to_records()[1].picture, None);
+    }
+
+    #[test]
+    fn styles_are_saved_only_when_not_plain() {
+        let (mut map, a, b, _) = sample_map();
+        let style = NodeStyle {
+            bold: true,
+            size: TextSize::Large,
+            ..NodeStyle::default()
+        };
+        map.set_style(a, style).expect("a");
+
+        let records = map.to_map_records();
+        let json = serde_json::to_string(&records.nodes[1]).expect("serializes");
+        assert!(
+            json.contains(r#""style":{"bold":true,"size":"large"}"#),
+            "{json}"
+        );
+        let plain = serde_json::to_string(&records.nodes[2]).expect("serializes");
+        assert!(!plain.contains("style"), "{plain}");
+        let rebuilt = MindMap::from_map_records(records).expect("valid");
+        assert_eq!(rebuilt.node(a).expect("a").style(), style);
+        assert!(rebuilt.node(b).expect("b").style().is_plain());
+        assert!(style.width_scale() > style.font_scale());
+    }
+
+    #[test]
+    fn a_branch_copy_is_a_map_of_its_own() {
+        let (mut map, a, b, a1) = sample_map();
+        let a2 = map.add_child(a, "a2").expect("a");
+        map.set_note(a1, "details").expect("a1");
+        map.add_cross_link(a1, a2).expect("valid");
+        map.add_cross_link(a2, b).expect("valid");
+
+        let copy = map.branch_copy(a).expect("a exists");
+
+        assert_eq!(copy.len(), 3);
+        let root = copy.node(copy.root()).expect("root");
+        assert_eq!((root.text(), root.parent()), ("a", None));
+        let texts: Vec<&str> = root
+            .children()
+            .iter()
+            .map(|&id| copy.node(id).expect("live").text())
+            .collect();
+        assert_eq!(texts, ["a1", "a2"]);
+        assert_eq!(copy.node(root.children()[0]).expect("a1").note(), "details");
+        // The link inside the branch comes along; the one leaving it does not.
+        assert_eq!(copy.cross_links().len(), 1);
+        assert_eq!(map.branch_copy(map.root()).expect("root").len(), map.len());
     }
 
     #[test]

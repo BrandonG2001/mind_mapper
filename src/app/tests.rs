@@ -261,12 +261,12 @@ fn export_reports_success_and_bad_extensions() {
         }
     };
 
-    app.export_to(&dir.path().join("map.md"));
+    app.export_to(&dir.path().join("map.md"), app.map.clone());
     assert_eq!(app.status, "Exporting map.md...");
     finish(&mut app);
     assert_eq!(app.status, "Exported map.md");
     assert!(dir.path().join("map.md").exists());
-    app.export_to(&dir.path().join("map.txt"));
+    app.export_to(&dir.path().join("map.txt"), app.map.clone());
     finish(&mut app);
 
     assert!(app.status.starts_with("Could not export map.txt"));
@@ -1184,4 +1184,69 @@ fn auto_save_waits_for_a_pause_and_never_overwrites_changes_made_elsewhere() {
     untitled.mark_dirty();
     assert_eq!(untitled.auto_save_file(100.0), None);
     assert!(untitled.dirty);
+}
+
+#[test]
+fn an_exported_branch_keeps_its_canvas_colours() {
+    let template = crate::start_screen::StartScreen::default()
+        .template_map(TemplateId::BuiltIn(2))
+        .expect("Project Plan");
+    let app = MindMapApp::with_map(template);
+    let find = |app: &MindMapApp, text: &str| {
+        app.map
+            .iter()
+            .find(|(_, node)| node.text() == text)
+            .map(|(id, _)| id)
+            .expect("in the template")
+    };
+    let timeline = find(&app, "Timeline");
+    // Colours as drawn on the canvas.
+    let mut accents = crate::map_view::Accents::default();
+    accents.reset(&app.map);
+    let mut drawn = std::collections::HashMap::new();
+    for visit in app.map.preorder() {
+        drawn.insert(
+            visit.node.text().to_owned(),
+            accents.resolve(&app.map, &visit, eframe::egui::Color32::BLACK),
+        );
+    }
+
+    let branch = app.branch_for_export(timeline).expect("exists");
+
+    assert_eq!(branch.len(), 4);
+    let mut copy_accents = crate::map_view::Accents::default();
+    copy_accents.reset(&branch);
+    for visit in branch.preorder() {
+        let color = copy_accents.resolve(&branch, &visit, eframe::egui::Color32::BLACK);
+        assert_eq!(
+            Some(&color),
+            drawn.get(visit.node.text()),
+            "{}",
+            visit.node.text()
+        );
+    }
+    // The map itself is unchanged.
+    assert!(app.map.node(timeline).expect("live").color().is_none());
+}
+
+#[test]
+fn style_changes_apply_to_each_selected_node_in_one_step() {
+    use crate::details::StyleChange;
+    use crate::model::TextSize;
+    let (mut app, [a, b, _]) = app_with_three_children();
+    let style = |app: &MindMapApp, id| app.map.node(id).expect("live").style();
+    app.select(Some(a));
+    app.style_selection(StyleChange::Size(TextSize::Larger));
+    app.select(Some(b));
+    app.toggle_selected(a);
+
+    // Bold for both; each keeps its own size.
+    app.perform(Action::ToggleBold);
+    assert!(style(&app, a).bold && style(&app, b).bold);
+    assert_eq!(style(&app, a).size, TextSize::Larger);
+    assert_eq!(style(&app, b).size, TextSize::Normal);
+
+    app.perform(Action::Undo);
+    assert!(!style(&app, a).bold && !style(&app, b).bold);
+    assert_eq!(style(&app, a).size, TextSize::Larger);
 }

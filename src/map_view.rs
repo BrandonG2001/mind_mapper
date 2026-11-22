@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use eframe::egui::{
     Align, Color32, Context, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
-    TextureHandle, TextureId, TextureOptions, Vec2, Visuals, epaint::CubicBezierShape,
-    text::LayoutJob,
+    TextureHandle, TextureId, TextureOptions, Vec2, Visuals,
+    epaint::CubicBezierShape,
+    text::{LayoutJob, TextFormat},
 };
 
 use crate::camera::Camera;
-use crate::model::{MindMap, Node, NodeColor, NodeId, Point, Visit};
+use crate::fonts;
+use crate::model::{MindMap, Node, NodeColor, NodeId, NodeStyle, Point, Visit};
 use crate::picture::Picture;
 
 /// Space between a node's picture and its label, at 100% zoom.
@@ -195,7 +197,6 @@ impl MapView {
         selected: impl Fn(NodeId) -> bool,
     ) {
         let zoom = self.camera.zoom();
-        let font = FontId::proportional(BASE_FONT_SIZE * zoom);
         let padding = NODE_PADDING * zoom;
         let text_color = visuals.strong_text_color();
         let edge_width = (2.0 * zoom).max(1.0);
@@ -236,15 +237,7 @@ impl MapView {
             }
 
             if cull_rect.contains(center) {
-                let mut job = LayoutJob::simple(
-                    visit.node.text().to_owned(),
-                    font.clone(),
-                    text_color,
-                    MAX_LABEL_WIDTH * zoom,
-                );
-                // Centre each line of a multi-line label, like the editor and exports.
-                job.halign = Align::Center;
-                let galley = painter.layout_job(job);
+                let galley = painter.layout_job(label_job(visit.node, text_color, zoom));
                 let picture_size = visit
                     .node
                     .picture()
@@ -732,6 +725,32 @@ pub(crate) fn estimated_size(text: &str) -> Vec2 {
     Vec2::new(text_width, text_height) + NODE_PADDING * 2.0
 }
 
+/// The estimated world-space size of a label (without padding) of `text` in `style`.
+pub(crate) fn estimated_label_size(text: &str, style: NodeStyle) -> Vec2 {
+    let plain = estimated_size(text) - NODE_PADDING * 2.0;
+    Vec2::new(plain.x * style.width_scale(), plain.y * style.font_scale())
+}
+
+/// How to lay out `node`'s label at `zoom`: in its style, wrapped as estimated (a bigger or
+/// bold label wraps at a proportionally wider width, so lines hold the same text), each
+/// line centred like the editor and exports.
+pub(crate) fn label_job(node: &Node, color: Color32, zoom: f32) -> LayoutJob {
+    let style = node.style();
+    let format = TextFormat {
+        font_id: FontId::new(
+            BASE_FONT_SIZE * style.font_scale() * zoom,
+            fonts::family(style.bold),
+        ),
+        color,
+        italics: style.italic,
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::single_section(node.text().to_owned(), format);
+    job.wrap.max_width = MAX_LABEL_WIDTH * style.width_scale() * zoom;
+    job.halign = Align::Center;
+    job
+}
+
 /// The size of a node's contents: its label of size `label`, with a picture of size
 /// `picture` (zero if none) above it, `zoom` setting the gap between them.
 fn content_size(label: Vec2, picture: Vec2, zoom: f32) -> Vec2 {
@@ -750,7 +769,7 @@ fn content_size(label: Vec2, picture: Vec2, zoom: f32) -> Vec2 {
 pub(crate) fn estimated_node_size(node: &Node) -> Vec2 {
     let picture = node.picture().map_or(Vec2::ZERO, Picture::display_size);
     content_size(
-        estimated_size(node.text()) - NODE_PADDING * 2.0,
+        estimated_label_size(node.text(), node.style()),
         picture,
         1.0,
     ) + NODE_PADDING * 2.0
@@ -759,7 +778,7 @@ pub(crate) fn estimated_node_size(node: &Node) -> Vec2 {
 /// Where a node's picture and label go inside its world-space box `rect`, for exports:
 /// the picture's rectangle (if it has one) and the centre of the label.
 pub(crate) fn node_contents(node: &Node, rect: Rect) -> (Option<Rect>, Pos2) {
-    let label_height = estimated_size(node.text()).y - NODE_PADDING.y * 2.0;
+    let label_height = estimated_label_size(node.text(), node.style()).y;
     let label_center = Pos2::new(
         rect.center().x,
         rect.max.y - NODE_PADDING.y - label_height * 0.5,

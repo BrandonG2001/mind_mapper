@@ -9,9 +9,9 @@ use super::{
     Action, Drag, EDITOR_PADDING, MIN_EDITOR_WIDTH, MindMapApp, NEW_NODE_TEXT, SCROLL_ZOOM_SPEED,
     node_label,
 };
-use crate::details::{self, DetailsPanel, color_palette};
+use crate::details::{self, DetailsPanel, color_palette, style_picker};
 use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT};
-use crate::model::{Node, NodeId};
+use crate::model::{Node, NodeId, NodeStyle};
 use crate::navigation::{self, Direction};
 
 impl MindMapApp {
@@ -215,9 +215,18 @@ impl MindMapApp {
                 .height()
                 .max((rows * LINE_HEIGHT + 2.0 * EDITOR_PADDING) * zoom),
         );
+        // The editor writes in the label's own size and weight.
+        let style = self
+            .map
+            .node(session.id)
+            .map_or_else(NodeStyle::default, Node::style);
+        let font = FontId::new(
+            BASE_FONT_SIZE * style.font_scale() * zoom,
+            crate::fonts::family(style.bold),
+        );
         let editor = egui::TextEdit::multiline(&mut session.buffer)
             .id(editor_id)
-            .font(FontId::proportional(BASE_FONT_SIZE * zoom))
+            .font(font)
             .hint_text(NEW_NODE_TEXT)
             .align(Align2::CENTER_CENTER);
         let response = ui.put(Rect::from_center_size(node_rect.center(), size), editor);
@@ -326,6 +335,15 @@ impl MindMapApp {
             self.color_selection(color);
             ui.close();
         }
+        let style = self
+            .map
+            .node(id)
+            .map_or_else(NodeStyle::default, Node::style);
+        if let Some(change) = style_picker(ui, style) {
+            self.focus(id);
+            self.style_selection(change);
+            ui.close();
+        }
         ui.separator();
         if ui.button("Notes and link...").clicked() {
             self.details.get_or_insert_with(DetailsPanel::default);
@@ -360,6 +378,12 @@ impl MindMapApp {
             ),
             ("Link to...", Action::StartLink, true, "Ctrl+K"),
             (
+                "Export branch...",
+                Action::ExportBranch,
+                true,
+                "Ctrl+Shift+E",
+            ),
+            (
                 "Delete",
                 Action::Delete,
                 self.selection().any(|selected| selected != root),
@@ -387,6 +411,11 @@ impl MindMapApp {
             self.remove_picture(id);
             ui.close();
         }
+        self.link_menu_items(ui, id);
+    }
+
+    /// The right-click menu's entries for labelling or removing each of `id`'s links.
+    fn link_menu_items(&mut self, ui: &mut Ui, id: NodeId) {
         let links = self.links_of(id);
         if !links.is_empty() {
             ui.separator();

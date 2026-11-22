@@ -2,13 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
+use eframe::egui::Color32;
 use rfd::FileDialog;
 
 use super::questions::Question;
-use super::{FILE_FILTER, IMPORT_FILTERS, MindMapApp, file_label};
+use super::{FILE_FILTER, IMPORT_FILTERS, MindMapApp, file_label, node_label};
 use crate::background::Job;
 use crate::export::{self, ExportStyle};
 use crate::formats::{self, Format};
+use crate::map_view::Accents;
+use crate::model::{MapError, MindMap, NodeColor, NodeId};
 use crate::settings::Settings;
 use crate::storage;
 
@@ -152,13 +155,29 @@ impl MindMapApp {
         }
     }
 
-    /// Ask where to export, then export there.
-    pub(super) fn export_dialog(&mut self) {
-        let stem = self
-            .file_path
-            .as_deref()
-            .and_then(Path::file_stem)
-            .map_or_else(|| "mind_map".into(), |stem| stem.to_string_lossy());
+    /// Ask where to export the map (or just the branch of `branch`), then export there.
+    pub(super) fn export_dialog(&mut self, branch: Option<NodeId>) {
+        let map = match branch {
+            Some(id) => match self.branch_for_export(id) {
+                Ok(map) => map,
+                Err(err) => {
+                    self.status = format!("Could not export the branch: {err}");
+                    return;
+                }
+            },
+            None => self.map.clone(),
+        };
+        let stem = match branch {
+            Some(id) => file_safe(&node_label(&self.map, id)),
+            None => self
+                .file_path
+                .as_deref()
+                .and_then(Path::file_stem)
+                .map_or_else(
+                    || "mind_map".to_owned(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                ),
+        };
         let dialog = FileDialog::new()
             .add_filter("PNG image", &["png"])
             .add_filter("SVG drawing", &["svg"])
@@ -168,24 +187,76 @@ impl MindMapApp {
             .add_filter(IMPORT_FILTERS[1].0, IMPORT_FILTERS[1].1)
             .set_file_name(format!("{stem}.png"));
         if let Some(path) = dialog.save_file() {
-            self.export_to(&path);
+            self.export_to(&path, map);
         }
     }
 
-    /// Export the map to `path` (format from its extension) in the current theme's colours.
+    /// The branch of `id` as a map of its own, keeping the colours it has on the canvas
+    /// (as the central idea of a new map it would otherwise get the first branch colours).
+    pub(super) fn branch_for_export(&self, id: NodeId) -> Result<MindMap, MapError> {
+        if id == self.map.root() {
+            return Ok(self.map.clone());
+        }
+        // Each node's colour on the canvas, by slot (O(1) lookups).
+        let mut accents = Accents::default();
+        accents.reset(&self.map);
+        let mut canvas_colors = vec![Color32::BLACK; self.map.slot_count()];
+        for visit in self.map.preorder() {
+            canvas_colors[visit.id.index()] = accents.resolve(&self.map, &visit, Color32::BLACK);
+        }
+        let color_of = |node: NodeId| {
+            canvas_colors
+                .get(node.index())
+                .map(|color| NodeColor::rgb(color.r(), color.g(), color.b()))
+        };
+        // Give the branch's node and its children their inherited colours as their own,
+        // so the copy (where they lead the top-level branches) looks the same.
+        let mut source = self.map.clone();
+        let node = self.map.node(id).ok_or(MapError::NodeNotFound(id))?;
+        for member in std::iter::once(id).chain(node.children().iter().copied()) {
+            if source
+                .node(member)
+                .is_some_and(|node| node.color().is_none())
+            {
+                source.set_color(member, color_of(member))?;
+            }
+        }
+        source.branch_copy(id)
+    }
+
+    /// Export `map` to `path` (format from its extension) in the current theme's colours.
     ///
     /// Runs on a background thread (a PNG of a huge map takes seconds); the status line
     /// reports the result when it is done.
-    pub(super) fn export_to(&mut self, path: &Path) {
+    pub(super) fn export_to(&mut self, path: &Path, map: MindMap) {
         let style = ExportStyle::from_visuals(&self.theme.visuals());
         let name = file_label(path).into_owned();
         self.status = format!("Exporting {name}...");
-        let map = self.map.clone();
         let path = path.to_owned();
         let job = Job::spawn(&self.ctx, "export", move || {
             export::export(&map, style, &path)
         });
         self.exports.push((name, job));
+    }
+}
+
+/// `name` with the characters file names cannot hold replaced, for a suggested name.
+fn file_safe(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim();
+    if safe.is_empty() {
+        "branch".to_owned()
+    } else {
+        safe.to_owned()
     }
 }
 

@@ -726,3 +726,46 @@ fn ctrl_h_replaces_text_across_the_map() {
         node_named(app, name);
     }
 }
+
+#[test]
+fn f1_lists_every_shortcut_until_escape() {
+    let mut harness = harness();
+    open_template(&mut harness, "Blank");
+
+    harness.key_press(Key::F1);
+    harness.run();
+
+    harness.get_by_label("Save as a new file");
+    harness.get_by_label("Link the selected node to the next node clicked");
+    harness.get_by_label("Ctrl+Shift+S");
+    harness.get_by_label("Drop a PNG or JPEG file on a node");
+    harness.key_press(Key::Escape);
+    harness.run();
+    assert!(harness.state().help.is_none());
+    assert!(harness.query_by_label("Save as a new file").is_none());
+}
+
+#[test]
+fn ctrl_b_and_the_side_panel_change_how_a_label_is_written() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let goals = node_named(harness.state(), "Goals");
+    click_with(&mut harness, goals, Modifiers::NONE);
+    let plain = harness.state().view.node_rect(goals).expect("drawn");
+
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::B);
+    harness.run();
+    let bold = harness.state().view.node_rect(goals).expect("drawn");
+    assert!(harness.state().map.node(goals).expect("live").style().bold);
+    assert!(bold.width() > plain.width(), "{plain:?} -> {bold:?}");
+
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::I);
+    harness.run();
+    harness.get_by_label("Larger").click();
+    harness.run();
+    let larger = harness.state().view.node_rect(goals).expect("drawn");
+    assert!(
+        larger.height() > bold.height() * 1.3,
+        "{bold:?} -> {larger:?}"
+    );
+}

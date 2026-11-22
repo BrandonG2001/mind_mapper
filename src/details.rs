@@ -1,9 +1,9 @@
-//! The details side panel: colour, notes and web link of the selected node.
+//! The details side panel: colour, text style, notes and web link of the selected node.
 
 use eframe::egui::{self, RichText, Ui, Vec2};
 
 use crate::map_view::to_color32;
-use crate::model::{MindMap, NodeColor, NodeId};
+use crate::model::{MindMap, NodeColor, NodeId, NodeStyle, TextSize};
 
 /// Colours offered for nodes: the ten Tableau 10 colours (the first six are also the
 /// automatic branch colours).
@@ -35,6 +35,31 @@ pub enum DetailsEdit {
     Color(Option<NodeColor>),
 }
 
+/// One change to how labels are written, applied to each selected node in turn (so a
+/// selection with mixed sizes keeps them when only bold is switched).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleChange {
+    /// Bold on or off.
+    Bold(bool),
+    /// Italic on or off.
+    Italic(bool),
+    /// A new size.
+    Size(TextSize),
+}
+
+impl StyleChange {
+    /// `style` with this change made.
+    #[must_use]
+    pub const fn apply(self, mut style: NodeStyle) -> NodeStyle {
+        match self {
+            Self::Bold(bold) => style.bold = bold,
+            Self::Italic(italic) => style.italic = italic,
+            Self::Size(size) => style.size = size,
+        }
+        style
+    }
+}
+
 /// What the user did in the panel this frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetailsOutcome {
@@ -42,8 +67,44 @@ pub struct DetailsOutcome {
     pub commit: bool,
     /// A colour was picked (`Some(None)` = back to automatic).
     pub color: Option<Option<NodeColor>>,
+    /// The text style was changed.
+    pub style: Option<StyleChange>,
     /// "Open link" was clicked for this address.
     pub open_link: Option<String>,
+}
+
+/// Bold and Italic toggles and the three sizes, showing `current`.
+///
+/// # Returns
+///
+/// The change clicked, if any.
+pub fn style_picker(ui: &mut Ui, current: NodeStyle) -> Option<StyleChange> {
+    let mut change = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(current.bold, RichText::new("Bold").strong())
+            .on_hover_text("Ctrl+B")
+            .clicked()
+        {
+            change = Some(StyleChange::Bold(!current.bold));
+        }
+        if ui
+            .selectable_label(current.italic, RichText::new("Italic").italics())
+            .clicked()
+        {
+            change = Some(StyleChange::Italic(!current.italic));
+        }
+        ui.separator();
+        for size in TextSize::ALL {
+            if ui
+                .selectable_label(current.size == size, size.name())
+                .clicked()
+            {
+                change = Some(StyleChange::Size(size));
+            }
+        }
+    });
+    change
 }
 
 /// Row of colour swatches plus "Auto".
@@ -146,6 +207,10 @@ impl DetailsPanel {
 
         ui.label(RichText::new("Colour").strong());
         outcome.color = color_palette(ui, node.color());
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("Text").strong());
+        outcome.style = style_picker(ui, node.style());
         ui.add_space(8.0);
 
         ui.label(RichText::new("Notes").strong());
