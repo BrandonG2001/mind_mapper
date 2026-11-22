@@ -1,6 +1,6 @@
 //! Pan/zoom transform between world (map) coordinates and screen pixels.
 
-use eframe::egui::{Pos2, Vec2};
+use eframe::egui::{Pos2, Rect, Vec2};
 
 use crate::model::Point;
 
@@ -63,10 +63,17 @@ impl Camera {
         self.offset = anchor - Pos2::new(world.x, world.y) * self.zoom;
     }
 
-    /// Reset to 100% zoom with `world` drawn at screen position `screen`.
-    pub fn center_on(&mut self, world: Point, screen: Pos2) {
-        self.zoom = 1.0;
-        self.offset = screen - Pos2::new(world.x, world.y);
+    /// Zoom and pan so the world-space rectangle `world` fills `screen`, never zooming in
+    /// past 100% and never out past `MIN_ZOOM`.
+    ///
+    /// # Arguments
+    ///
+    /// * `world` - Area of the map to show, in world units
+    /// * `screen` - Screen area to show it in
+    pub fn fit(&mut self, world: Rect, screen: Rect) {
+        let scale = screen.size() / world.size().max(Vec2::splat(1.0));
+        self.zoom = scale.min_elem().clamp(MIN_ZOOM, 1.0);
+        self.offset = screen.center() - world.center() * self.zoom;
     }
 }
 
@@ -113,16 +120,28 @@ mod tests {
     }
 
     #[test]
-    fn center_on_places_world_point() {
+    fn fit_centres_and_scales_down_large_areas() {
         let mut camera = Camera::default();
-        camera.zoom_at(Pos2::ZERO, 2.0);
+        let world = Rect::from_min_max(Pos2::new(-100.0, -50.0), Pos2::new(300.0, 50.0));
+        let screen = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(200.0, 200.0));
 
-        camera.center_on(Point::new(10.0, 20.0), Pos2::new(400.0, 300.0));
+        camera.fit(world, screen);
+
+        assert_eq!(camera.zoom(), 0.5);
+        assert_close(
+            camera.world_to_screen(Point::new(100.0, 0.0)),
+            screen.center(),
+        );
+    }
+
+    #[test]
+    fn fit_never_zooms_past_full_size() {
+        let mut camera = Camera::default();
+        let world = Rect::from_center_size(Pos2::ZERO, Vec2::splat(10.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::splat(1000.0));
+
+        camera.fit(world, screen);
 
         assert_eq!(camera.zoom(), 1.0);
-        assert_close(
-            camera.world_to_screen(Point::new(10.0, 20.0)),
-            Pos2::new(400.0, 300.0),
-        );
     }
 }

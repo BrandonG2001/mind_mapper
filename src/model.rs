@@ -237,6 +237,32 @@ impl MindMap {
     /// Returns `MapError::NodeNotFound` if `parent` does not exist.
     pub fn add_child(&mut self, parent: NodeId, text: &str) -> Result<NodeId, MapError> {
         let position = self.next_child_position(parent)?;
+        self.add_child_at(parent, text, position)
+    }
+
+    /// Add a new child under `parent` at an explicit world position.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - Node that will own the new child
+    /// * `text` - Label of the new node
+    /// * `position` - Centre of the new node in world coordinates
+    ///
+    /// # Returns
+    ///
+    /// The id of the new node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `parent` does not exist.
+    pub fn add_child_at(
+        &mut self,
+        parent: NodeId,
+        text: &str,
+        position: Point,
+    ) -> Result<NodeId, MapError> {
+        // Validate before touching the slab so a failure leaves the map unchanged.
+        self.node(parent).ok_or(MapError::NodeNotFound(parent))?;
         let node = Node {
             text: text.to_owned(),
             position,
@@ -484,6 +510,22 @@ mod tests {
         let result = map.add_child(NodeId(42), "x");
 
         assert_eq!(result, Err(MapError::NodeNotFound(NodeId(42))));
+    }
+
+    #[test]
+    fn add_child_at_uses_given_position_and_validates_parent() {
+        let mut map = MindMap::new("root");
+
+        let id = map
+            .add_child_at(map.root(), "x", Point::new(-5.0, 7.0))
+            .expect("root exists");
+
+        assert_eq!(map.node(id).expect("x").position(), Point::new(-5.0, 7.0));
+        assert_eq!(
+            map.add_child_at(NodeId(9), "y", Point::default()),
+            Err(MapError::NodeNotFound(NodeId(9)))
+        );
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

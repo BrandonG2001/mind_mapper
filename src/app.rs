@@ -1,30 +1,22 @@
-//! The egui application: toolbar, canvas rendering and user interaction.
+//! The egui application: start screen, toolbar, canvas and user interaction.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Galley, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2,
-    Rect, Response, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, ViewportCommand, Visuals,
-    epaint::CubicBezierShape,
+    self, Align2, FontId, Key, KeyboardShortcut, Modifiers, PointerButton, Rect, Response, Sense,
+    Ui, Vec2, ViewportCommand,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
-use crate::camera::Camera;
 use crate::history::History;
+use crate::map_view::{BASE_FONT_SIZE, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
+use crate::start_screen::{StartChoice, StartScreen};
 use crate::storage;
+use crate::theme::{ColorTheme, theme_picker};
 
-/// Font size of node labels at 100% zoom.
-const BASE_FONT_SIZE: f32 = 16.0;
-/// Space between a node's label and its border at 100% zoom.
-const NODE_PADDING: Vec2 = Vec2::new(14.0, 8.0);
-/// Labels wider than this (at 100% zoom) wrap onto several lines.
-const MAX_LABEL_WIDTH: f32 = 240.0;
 /// Narrowest text box shown while editing, at 100% zoom.
 const MIN_EDITOR_WIDTH: f32 = 140.0;
-/// Rounded-corner radius of node boxes at 100% zoom.
-const CORNER_RADIUS: f32 = 8.0;
 /// Number of undo steps kept.
 const HISTORY_LIMIT: usize = 200;
 /// How strongly one scroll-wheel pixel changes the zoom.
@@ -35,16 +27,6 @@ const DEFAULT_ROOT_TEXT: &str = "Central idea";
 const NEW_NODE_TEXT: &str = "New idea";
 /// File-dialog filter name and extension.
 const FILE_FILTER: (&str, &[&str]) = ("Mind map", &["json"]);
-/// Accent colours cycled through for the root's branches.
-const BRANCH_COLORS: [Color32; 6] = [
-    Color32::from_rgb(0x4e, 0x79, 0xa7),
-    Color32::from_rgb(0xf2, 0x8e, 0x2b),
-    Color32::from_rgb(0x59, 0xa1, 0x4f),
-    Color32::from_rgb(0xe1, 0x57, 0x59),
-    Color32::from_rgb(0xb0, 0x7a, 0xa1),
-    Color32::from_rgb(0x76, 0xb7, 0xb2),
-];
-
 /// Something the user can trigger from the toolbar or the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -59,7 +41,6 @@ enum Action {
     Rename,
     Delete,
     CenterView,
-    ToggleTheme,
 }
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
@@ -115,13 +96,13 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 12] = [
     ),
 ];
 
-/// A node's on-screen geometry for the current frame.
-#[derive(Debug, Clone)]
-struct LaidOutNode {
-    id: NodeId,
-    rect: Rect,
-    galley: Arc<Galley>,
-    accent: Color32,
+/// Which page the window is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    /// The template gallery. `can_return` is true when a map was already open.
+    Start { can_return: bool },
+    /// The mind-map editor.
+    Editor,
 }
 
 /// A label that is being edited in place.
@@ -143,36 +124,38 @@ enum Drag {
 
 /// The mind-mapping application state.
 pub struct MindMapApp {
+    screen: Screen,
+    start: StartScreen,
     map: MindMap,
     history: History<MindMap>,
-    camera: Camera,
+    view: MapView,
     selected: Option<NodeId>,
     editing: Option<EditSession>,
     drag: Option<Drag>,
     file_path: Option<PathBuf>,
     dirty: bool,
-    dark_mode: bool,
-    /// The view is centred on the root once the canvas size is known.
-    needs_centering: bool,
-    canvas_rect: Rect,
-    /// Reused every frame to avoid reallocating.
-    layout: Vec<LaidOutNode>,
+    theme: ColorTheme,
+    /// The theme last installed in egui; `None` until the first frame.
+    applied_theme: Option<ColorTheme>,
+    /// The whole map is fitted into view once the canvas size is known.
+    needs_fit: bool,
     window_title: String,
     status: String,
 }
 
 impl MindMapApp {
-    /// Create the app, optionally opening the map at `initial_path`.
+    /// Create the app on the start screen, or straight in the editor if `initial_path`
+    /// opens successfully.
     ///
     /// # Arguments
     ///
-    /// * `cc` - eframe creation context, used to apply the dark theme
-    /// * `initial_path` - File passed on the command line, if any. A load failure is shown
-    ///   in the status bar and the app starts with an empty map instead.
+    /// * `cc` - eframe creation context; its storage provides the saved theme
+    /// * `initial_path` - File passed on the command line, if any. If it fails to load,
+    ///   the app stays on the start screen.
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<&Path>) -> Self {
-        cc.egui_ctx.set_theme(Theme::Dark);
         let mut app = Self::with_map(MindMap::new(DEFAULT_ROOT_TEXT));
+        app.theme = ColorTheme::load(cc.storage);
         if let Some(path) = initial_path {
             app.open_path(path);
         }
@@ -181,18 +164,19 @@ impl MindMapApp {
 
     fn with_map(map: MindMap) -> Self {
         Self {
+            screen: Screen::Start { can_return: false },
+            start: StartScreen::default(),
             map,
             history: History::new(HISTORY_LIMIT),
-            camera: Camera::default(),
+            view: MapView::default(),
             selected: None,
             editing: None,
             drag: None,
             file_path: None,
             dirty: false,
-            dark_mode: true,
-            needs_centering: true,
-            canvas_rect: Rect::NOTHING,
-            layout: Vec::new(),
+            theme: ColorTheme::default(),
+            applied_theme: None,
+            needs_fit: true,
             window_title: String::new(),
             status: String::new(),
         }
@@ -222,11 +206,7 @@ impl MindMapApp {
         self.commit_edit();
         let root = self.map.root();
         match action {
-            Action::New => {
-                if self.confirm_discard() {
-                    self.replace_map(MindMap::new(DEFAULT_ROOT_TEXT), None);
-                }
-            }
+            Action::New => self.screen = Screen::Start { can_return: true },
             Action::Open => {
                 if self.confirm_discard()
                     && let Some(path) = file_dialog().pick_file()
@@ -284,8 +264,7 @@ impl MindMapApp {
                     }
                 }
             }
-            Action::CenterView => self.needs_centering = true,
-            Action::ToggleTheme => self.dark_mode = !self.dark_mode,
+            Action::CenterView => self.needs_fit = true,
         }
     }
 
@@ -304,7 +283,23 @@ impl MindMapApp {
         self.drag = None;
         self.file_path = path;
         self.dirty = false;
-        self.needs_centering = true;
+        self.needs_fit = true;
+        self.screen = Screen::Editor;
+    }
+
+    /// Act on a start-screen choice.
+    fn choose(&mut self, choice: StartChoice) {
+        match choice {
+            StartChoice::Template(index) => {
+                if let Some(map) = self.start.template_map(index)
+                    && self.confirm_discard()
+                {
+                    self.replace_map(map, None);
+                }
+            }
+            StartChoice::Open => self.perform(Action::Open),
+            StartChoice::Back => self.screen = Screen::Editor,
+        }
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -363,21 +358,15 @@ impl MindMapApp {
         }
     }
 
-    fn hit_test(&self, screen: Pos2) -> Option<NodeId> {
-        // Reverse order: nodes painted last are on top.
-        self.layout
-            .iter()
-            .rev()
-            .find(|node| node.rect.contains(screen))
-            .map(|node| node.id)
-    }
-
     fn title(&self) -> String {
         let name = self
             .file_path
             .as_deref()
             .and_then(Path::file_name)
             .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
+        if matches!(self.screen, Screen::Start { .. }) {
+            return "Mind Mapper".to_owned();
+        }
         let marker = if self.dirty { "*" } else { "" };
         format!("{marker}{name} - Mind Mapper")
     }
@@ -416,16 +405,10 @@ impl MindMapApp {
                 }
             }
             ui.separator();
-            let theme_label = if self.dark_mode {
-                "Light mode"
-            } else {
-                "Dark mode"
-            };
-            if ui.button(theme_label).clicked() {
-                clicked = Some(Action::ToggleTheme);
-            }
+            ui.label("Theme");
+            theme_picker(ui, &mut self.theme);
             ui.separator();
-            ui.label(format!("{:.0}%", self.camera.zoom() * 100.0));
+            ui.label(format!("{:.0}%", self.view.camera().zoom() * 100.0));
             ui.label(&self.status);
         });
         clicked
@@ -446,7 +429,7 @@ impl MindMapApp {
         if (factor - 1.0).abs() > f32::EPSILON
             && let Some(anchor) = pointer
         {
-            self.camera.zoom_at(anchor, factor);
+            self.view.camera_mut().zoom_at(anchor, factor);
         }
     }
 
@@ -457,7 +440,7 @@ impl MindMapApp {
             let target = ui
                 .input(|input| input.pointer.press_origin())
                 .filter(|_| response.dragged_by(PointerButton::Primary))
-                .and_then(|origin| self.hit_test(origin));
+                .and_then(|origin| self.view.hit_test(origin));
             self.drag = Some(match target {
                 Some(id) => {
                     self.history.record(self.map.clone());
@@ -471,7 +454,7 @@ impl MindMapApp {
             let delta = response.drag_delta();
             match self.drag {
                 Some(Drag::Node(id)) => {
-                    let world_delta = delta / self.camera.zoom();
+                    let world_delta = delta / self.view.camera().zoom();
                     if self
                         .map
                         .translate_subtree(id, world_delta.x, world_delta.y)
@@ -480,7 +463,7 @@ impl MindMapApp {
                         self.dirty = true;
                     }
                 }
-                Some(Drag::Pan) => self.camera.pan(delta),
+                Some(Drag::Pan) => self.view.camera_mut().pan(delta),
                 None => {}
             }
         }
@@ -490,7 +473,7 @@ impl MindMapApp {
 
         let hit = response
             .interact_pointer_pos()
-            .and_then(|pos| self.hit_test(pos));
+            .and_then(|pos| self.view.hit_test(pos));
         if response.double_clicked() {
             self.perform_on(hit, Action::Rename);
         } else if response.clicked() {
@@ -507,96 +490,17 @@ impl MindMapApp {
         }
     }
 
-    /// Lay out the visible nodes and paint edges and nodes.
-    fn paint(&mut self, painter: &egui::Painter, visuals: &Visuals) {
-        let zoom = self.camera.zoom();
-        let font = FontId::proportional(BASE_FONT_SIZE * zoom);
-        let padding = NODE_PADDING * zoom;
-        let text_color = visuals.strong_text_color();
-        let edge_width = (2.0 * zoom).max(1.0);
-        let clip = painter.clip_rect();
-        // Nodes are positioned by their centre, so widen the clip test by the largest
-        // likely half-size to keep partly visible nodes.
-        let cull_rect = clip.expand(MAX_LABEL_WIDTH * zoom);
-
-        self.layout.clear();
-        for visit in self.map.preorder() {
-            let accent = visit.branch.map_or(text_color, |branch| {
-                BRANCH_COLORS[branch % BRANCH_COLORS.len()]
-            });
-            let center = self.camera.world_to_screen(visit.node.position());
-
-            if let Some(parent) = visit.node.parent().and_then(|id| self.map.node(id)) {
-                let start = self.camera.world_to_screen(parent.position());
-                if clip.intersects(Rect::from_two_pos(start, center)) {
-                    let bend = Vec2::new((center.x - start.x) * 0.5, 0.0);
-                    painter.add(CubicBezierShape::from_points_stroke(
-                        [start, start + bend, center - bend, center],
-                        false,
-                        Color32::TRANSPARENT,
-                        Stroke::new(edge_width, accent),
-                    ));
-                }
-            }
-
-            if cull_rect.contains(center) {
-                let galley = painter.layout(
-                    visit.node.text().to_owned(),
-                    font.clone(),
-                    text_color,
-                    MAX_LABEL_WIDTH * zoom,
-                );
-                let rect = Rect::from_center_size(center, galley.size() + padding * 2.0);
-                self.layout.push(LaidOutNode {
-                    id: visit.id,
-                    rect,
-                    galley,
-                    accent,
-                });
-            }
-        }
-
-        let radius = CORNER_RADIUS * zoom;
-        let fill = visuals.window_fill();
-        let selection = visuals.selection.stroke.color;
-        for node in &self.layout {
-            let is_selected = self.selected == Some(node.id);
-            let (border, width) = if is_selected {
-                (selection, edge_width * 2.0)
-            } else {
-                (node.accent, edge_width)
-            };
-            painter.rect_filled(node.rect, radius, fill);
-            painter.rect_stroke(
-                node.rect,
-                radius,
-                Stroke::new(width, border),
-                StrokeKind::Inside,
-            );
-            painter.galley(
-                node.rect.center() - node.galley.size() * 0.5,
-                Arc::clone(&node.galley),
-                text_color,
-            );
-        }
-    }
-
     /// Show the in-place text box for the node being edited.
     fn show_editor(&mut self, ui: &mut Ui) {
         let Some(session) = self.editing.as_mut() else {
             return;
         };
-        let Some(node_rect) = self
-            .layout
-            .iter()
-            .find(|node| node.id == session.id)
-            .map(|node| node.rect)
-        else {
+        let Some(node_rect) = self.view.node_rect(session.id) else {
             // The node scrolled out of view (or was deleted): finish the edit.
             self.commit_edit();
             return;
         };
-        let zoom = self.camera.zoom();
+        let zoom = self.view.camera().zoom();
         let size = Vec2::new(
             node_rect.width().max(MIN_EDITOR_WIDTH * zoom),
             node_rect.height(),
@@ -621,31 +525,29 @@ impl MindMapApp {
 
     fn canvas(&mut self, ui: &mut Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        self.canvas_rect = response.rect;
-        if self.needs_centering {
-            let root = self.map.node(self.map.root()).map(Node::position);
-            if let Some(root) = root {
-                self.camera.center_on(root, self.canvas_rect.center());
-            }
-            self.needs_centering = false;
+        if self.needs_fit {
+            self.view.fit(&self.map, response.rect);
+            self.needs_fit = false;
         }
-        painter.rect_filled(self.canvas_rect, 0.0, ui.visuals().extreme_bg_color);
+        painter.rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
         self.handle_zoom(ui, &response);
         self.handle_pointer(ui, &response);
-        self.paint(&painter, ui.visuals());
+        self.view
+            .paint(&painter, ui.visuals(), &self.map, self.selected);
         self.show_editor(ui);
+    }
+
+    /// Install the chosen theme in egui if it changed since the last frame.
+    fn sync_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_theme != Some(self.theme) {
+            self.theme.apply(ctx);
+            self.applied_theme = Some(self.theme);
+        }
     }
 
     fn handle_window(&mut self, ui: &Ui) {
         let ctx = ui.ctx();
-        let theme = if self.dark_mode {
-            Theme::Dark
-        } else {
-            Theme::Light
-        };
-        if ctx.theme() != theme {
-            ctx.set_theme(theme);
-        }
+        self.sync_theme(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.confirm_discard() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
         }
@@ -668,9 +570,12 @@ impl MindMapApp {
                 memory.surrender_focus(id);
             }
         });
+        // Only "Open" makes sense while the start screen is showing.
+        let on_start = matches!(self.screen, Screen::Start { .. });
         let pressed = ctx.input_mut(|input| {
             SHORTCUTS
                 .iter()
+                .filter(|(_, action)| !on_start || *action == Action::Open)
                 .find(|(shortcut, _)| input.consume_shortcut(shortcut))
                 .map(|&(_, action)| action)
         });
@@ -686,9 +591,23 @@ fn file_dialog() -> FileDialog {
 }
 
 impl eframe::App for MindMapApp {
+    /// Called by eframe on exit and periodically, to remember settings between runs.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.theme.save(storage);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_window(ui);
         self.handle_shortcuts(ui);
+        if let Screen::Start { can_return } = self.screen {
+            let choice = egui::CentralPanel::default()
+                .show(ui, |ui| self.start.show(ui, can_return, &mut self.theme))
+                .inner;
+            if let Some(choice) = choice {
+                self.choose(choice);
+            }
+            return;
+        }
         let clicked = egui::Panel::top("toolbar")
             .show(ui, |ui| self.toolbar(ui))
             .inner;
@@ -793,44 +712,54 @@ mod tests {
         assert_eq!(app.map.len(), 1);
     }
 
-    /// Lay out an empty label with egui's real font system (headless, no window).
-    fn empty_galley() -> Arc<Galley> {
-        let ctx = egui::Context::default();
-        let mut galley = None;
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            galley = Some(ui.painter().layout_no_wrap(
-                String::new(),
-                FontId::default(),
-                Color32::WHITE,
-            ));
-        });
-        // Nothing renders the frame, so discard its texture uploads explicitly.
-        output.textures_delta.clear();
-        galley.expect("run_ui calls the closure once")
+    #[test]
+    fn app_starts_on_start_screen() {
+        let app = MindMapApp::with_map(MindMap::new("root"));
+
+        assert_eq!(app.screen, Screen::Start { can_return: false });
+        assert_eq!(app.title(), "Mind Mapper");
     }
 
     #[test]
-    fn hit_test_prefers_topmost_node() {
+    fn choosing_a_template_opens_it_in_the_editor() {
         let mut app = MindMapApp::with_map(MindMap::new("root"));
-        let root = app.map.root();
-        let child = app.map.add_child(root, "x").expect("root exists");
-        let galley = empty_galley();
-        let make = |id, min: Pos2| LaidOutNode {
-            id,
-            rect: Rect::from_min_size(min, Vec2::splat(10.0)),
-            galley: Arc::clone(&galley),
-            accent: Color32::WHITE,
-        };
-        app.layout = vec![make(root, Pos2::ZERO), make(child, Pos2::new(5.0, 5.0))];
+        let expected = app.start.template_map(2).expect("template exists");
 
-        assert_eq!(app.hit_test(Pos2::new(7.0, 7.0)), Some(child));
-        assert_eq!(app.hit_test(Pos2::new(1.0, 1.0)), Some(root));
-        assert_eq!(app.hit_test(Pos2::new(50.0, 50.0)), None);
+        app.choose(StartChoice::Template(2));
+
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.map, expected);
+        assert!(!app.dirty);
+        assert!(app.file_path.is_none());
+        assert!(app.needs_fit);
+    }
+
+    #[test]
+    fn new_shows_start_screen_and_back_returns_unchanged() {
+        let (mut app, child) = app_with_child();
+        app.screen = Screen::Editor;
+
+        app.perform(Action::New);
+        assert_eq!(app.screen, Screen::Start { can_return: true });
+        app.choose(StartChoice::Back);
+
+        assert_eq!(app.screen, Screen::Editor);
+        assert!(app.map.node(child).is_some());
+    }
+
+    #[test]
+    fn out_of_range_template_is_ignored() {
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+
+        app.choose(StartChoice::Template(usize::MAX));
+
+        assert_eq!(app.screen, Screen::Start { can_return: false });
     }
 
     #[test]
     fn title_reflects_file_and_dirty_state() {
         let (mut app, _) = app_with_child();
+        app.screen = Screen::Editor;
         assert_eq!(app.title(), "*Untitled - Mind Mapper");
 
         app.file_path = Some(PathBuf::from("ideas.json"));
@@ -840,11 +769,17 @@ mod tests {
     }
 
     #[test]
-    fn toggle_theme_flips_mode() {
+    fn sync_theme_installs_chosen_theme() {
         let mut app = MindMapApp::with_map(MindMap::new("root"));
+        let ctx = egui::Context::default();
 
-        app.perform(Action::ToggleTheme);
+        app.theme = ColorTheme::LightPurple;
+        app.sync_theme(&ctx);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        app.theme = ColorTheme::DarkBlue;
+        app.sync_theme(&ctx);
 
-        assert!(!app.dark_mode);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert_eq!(app.applied_theme, Some(ColorTheme::DarkBlue));
     }
 }
