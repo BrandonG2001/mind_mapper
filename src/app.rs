@@ -1,5 +1,6 @@
 //! The egui application: start screen, toolbar, canvas and user interaction.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers, Ui, ViewportCommand};
@@ -27,6 +28,7 @@ mod editing;
 mod files;
 mod panels;
 mod questions;
+mod selection;
 
 /// Application name: window title, and the folder name for settings and recovery data.
 pub const APP_NAME: &str = "Mind Mapper";
@@ -68,6 +70,8 @@ enum Action {
     Tidy,
     ToggleCollapse,
     Navigate(Direction),
+    /// Swap the selected node with its sibling above (`Up`) or below (`Down`).
+    Reorder(Direction),
     Export,
     Find,
     FindNext,
@@ -86,7 +90,16 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 24] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 26] = [
+    // Before the plain arrows, which also match while Alt is held.
+    (
+        KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp),
+        Action::Reorder(Direction::Up),
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::ALT, Key::ArrowDown),
+        Action::Reorder(Direction::Down),
+    ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S),
         Action::SaveAs,
@@ -203,15 +216,17 @@ struct EditSession {
 }
 
 /// What the current mouse drag is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Drag {
-    /// Moving a node and its descendants.
-    Node {
-        /// The node being dragged.
-        id: NodeId,
-        /// Node under the cursor that the branch would be re-attached to if dropped now.
+    /// Moving the selected branches.
+    Nodes {
+        /// The selected branches being moved (see `selected_branches`).
+        branches: Vec<NodeId>,
+        /// Node under the cursor that the branches would be re-attached to if dropped now.
         drop_target: Option<NodeId>,
     },
+    /// Drawing a selection box (Shift+drag on empty canvas) from this screen point.
+    Select { origin: egui::Pos2 },
     /// Moving the view.
     Pan,
 }
@@ -243,10 +258,10 @@ pub struct MindMapApp {
     recovered: Option<Recovered>,
     /// A command-line file held back until the recovered work has been dealt with.
     deferred_open: Option<PathBuf>,
+    /// Nodes selected besides the main one (`selected`), with Ctrl+click or a box.
+    also_selected: HashSet<NodeId>,
     /// A question shown over the window, waiting for the user's answer.
     question: Option<Question>,
-    /// The user agreed to discard unsaved work and close, so the next close goes ahead.
-    close_confirmed: bool,
     /// The map changed since the last recovery copy was written.
     autosave_pending: bool,
     /// When the last recovery copy was written, in seconds since the app started.
@@ -357,7 +372,7 @@ impl MindMapApp {
             recovered: None,
             deferred_open: None,
             question: None,
-            close_confirmed: false,
+            also_selected: HashSet::new(),
             autosave_pending: false,
             last_autosave: 0.0,
             recent: RecentFiles::default(),
@@ -447,14 +462,7 @@ impl MindMapApp {
                     self.start_edit(id, text);
                 }
             }
-            Action::Delete => {
-                if let Some(id) = self.selected.filter(|&id| id != root) {
-                    let parent = self.map.node(id).and_then(Node::parent);
-                    if self.edit_map(|map| map.remove_subtree(id)).is_some() {
-                        self.selected = parent;
-                    }
-                }
-            }
+            Action::Delete => self.delete_selection(),
             Action::CenterView => self.needs_fit = true,
             Action::Tidy => {
                 self.edit_map(layout::tidy);
@@ -466,6 +474,7 @@ impl MindMapApp {
             }
             Action::Export => self.export_dialog(),
             Action::Navigate(direction) => self.navigate(direction),
+            Action::Reorder(direction) => self.reorder(direction),
             Action::Find => match &mut self.search {
                 Some(search) => search.request_focus(),
                 None => self.search = Some(Search::new()),
@@ -515,10 +524,7 @@ impl MindMapApp {
             self.ui_zoom = zoom;
             self.update_settings(|settings| settings.ui_zoom = zoom);
         }
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.close_confirmed
-            && self.has_unsaved_work()
-        {
+        if ctx.input(|input| input.viewport().close_requested()) && self.has_unsaved_work() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.question = Some(Question::Discard(AfterDiscard::Close));
         }

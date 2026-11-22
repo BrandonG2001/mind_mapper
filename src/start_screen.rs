@@ -210,7 +210,7 @@ impl StartScreen {
             painter.rect_filled(preview, CARD_RADIUS * 0.6, visuals.extreme_bg_color);
             self.preview.fit(map, preview.shrink(GAP * 0.5));
             self.preview
-                .paint(&painter.with_clip_rect(preview), visuals, map, None);
+                .paint(&painter.with_clip_rect(preview), visuals, map, |_| false);
 
             let text_left = rect.min.x + GAP;
             let title_top = preview.max.y + GAP * 0.5;

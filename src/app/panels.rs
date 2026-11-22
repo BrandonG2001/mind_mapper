@@ -59,7 +59,7 @@ impl MindMapApp {
         let mut clicked = None;
         let root = self.map.root();
         let has_selection = self.selected.is_some();
-        let can_delete = self.selected.is_some_and(|id| id != root);
+        let can_delete = self.selection().any(|id| id != root);
         let (can_fold, fold_label) = self.fold_state();
         let buttons = [
             ("New", Action::New, true, "Ctrl+N"),
@@ -182,7 +182,7 @@ impl MindMapApp {
                 self.apply_details(id, &panel.pending(&self.map));
             }
             if let Some(color) = outcome.color {
-                self.apply_details(id, &[DetailsEdit::Color(color)]);
+                self.color_selection(color);
             }
         }
         if let Some(address) = outcome.open_link {

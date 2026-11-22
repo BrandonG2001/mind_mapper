@@ -16,7 +16,10 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Keyboard-first editing**: Tab adds a child, Enter adds a sibling, and you type the
   label straight away. The arrow keys move around the map.
 - **Drag to rearrange**: moving a node moves all of its descendants with it. Drop it onto
-  another node to move the whole branch under that node.
+  another node to move the whole branch under that node. Alt+Up/Down swaps a node with the
+  sibling above or below it.
+- **Multi-select**: Ctrl+click nodes or Shift+drag a box around them, then move, colour,
+  copy or delete them together.
 - **Tidy up**: one click re-arranges the whole map so nothing overlaps, keeping each branch
   on its side and siblings in their order.
 - **Collapse and expand branches** to keep large maps readable. Folded branches stay folded
@@ -90,11 +93,12 @@ mind_mapper path/to/ideas.json
 | Action | How |
 |---|---|
 | Select a node | Click it |
+| Select several nodes | Ctrl+click each one (again to deselect), or Shift+drag a box around them (Ctrl+Shift+drag adds to the selection) |
 | Rename a node | Double-click it |
-| Move a node and its branch | Drag it |
+| Move a node and its branch | Drag it (with several selected, they all move) |
 | Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
 | Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
-| Colour, notes, rename or delete a node | Right-click it |
+| Colour, notes, rename, reorder or delete a node | Right-click it (colour and delete apply to every selected node) |
 | Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
@@ -107,15 +111,16 @@ mind_mapper path/to/ideas.json
 | Enter | Add a sibling to the selected node |
 | F2 | Rename the selected node |
 | Ctrl + / Ctrl - / Ctrl 0 | Make the interface larger / smaller / reset it to 100% |
-| Delete | Delete the selected node and its branch |
+| Delete | Delete the selected nodes and their branches |
 | Home | Fit the whole map in the window |
 | Ctrl+L | Tidy up: arrange the map without overlaps |
 | Space | Collapse or expand the selected node's branch |
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
+| Alt+Up / Alt+Down | Swap the selected node (with its branch) with the sibling above / below it |
 | Ctrl+E | Export as PNG, SVG or Markdown (chosen by the file extension) |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
-| Ctrl+C / Ctrl+X | Copy / cut the selected branch (or copy the whole map) as an indented outline |
+| Ctrl+C / Ctrl+X | Copy / cut the selected branches (or copy the whole map) as an indented outline |
 | Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
@@ -238,6 +243,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
 | [`src/app/files.rs`](src/app/files.rs) | Open, save (with the overwrite check), export, settings |
 | [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
+| [`src/app/selection.rs`](src/app/selection.rs) | Multi-select, and the edits that act on every selected node |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |
 
 ### Changing the icon

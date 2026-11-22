@@ -46,11 +46,14 @@ impl MindMapApp {
             .edit_map(|map| map.set_collapsed(id, collapse))
             .is_some()
             && collapse
-            && self
-                .selected
-                .is_some_and(|selected| self.map.is_in_subtree(selected, id))
         {
-            self.selected = Some(id);
+            let map = &self.map;
+            let hidden = |selected: NodeId| selected != id && map.is_in_subtree(selected, id);
+            self.also_selected.retain(|&selected| !hidden(selected));
+            if self.selected.is_some_and(hidden) {
+                self.selected = Some(id);
+                self.also_selected.remove(&id);
+            }
         }
     }
 
@@ -68,8 +71,7 @@ impl MindMapApp {
     }
 
     pub(super) fn after_history_change(&mut self) {
-        let map = &self.map;
-        self.selected = self.selected.filter(|&id| map.node(id).is_some());
+        self.prune_selection();
         self.editing = None;
         // Reload the side panel so it shows (and will not re-apply) the undone text.
         if let Some(panel) = &mut self.details {
@@ -81,7 +83,7 @@ impl MindMapApp {
     pub(super) fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
         self.map = map;
         self.history = History::new(HISTORY_LIMITS);
-        self.selected = None;
+        self.select(None);
         self.editing = None;
         self.drag = None;
         // Node ids of the old map mean nothing in the new one.
@@ -105,13 +107,13 @@ impl MindMapApp {
             None => Some(self.map.root()),
         };
         if target.is_some() {
-            self.selected = target;
+            self.select(target);
             self.reveal = target;
         }
     }
 
     pub(super) fn start_edit(&mut self, id: NodeId, buffer: String) {
-        self.selected = Some(id);
+        self.focus(id);
         self.editing = Some(EditSession {
             id,
             buffer,
@@ -150,23 +152,25 @@ impl MindMapApp {
                     .try_for_each(|&ancestor| map.set_collapsed(ancestor, false))
             });
         }
-        self.selected = Some(id);
+        self.select(Some(id));
         self.reveal = Some(id);
     }
 
-    /// Copy the selected branch (or the whole map) to the system clipboard as an outline,
-    /// removing it from the map when `cut` is true.
+    /// Copy the selected branches (or the whole map) to the system clipboard as an
+    /// outline, removing them from the map when `cut` is true.
     pub(super) fn copy_branch(&mut self, ctx: &egui::Context, cut: bool) {
         let root = self.map.root();
-        let branch = self.selected.unwrap_or(root);
-        if cut && branch == root {
+        let mut branches = self.selected_branches();
+        if branches.is_empty() {
+            branches.push(root);
+        }
+        if cut && branches.contains(&root) {
             "Select a branch to cut; the central idea cannot be removed"
                 .clone_into(&mut self.status);
             return;
         }
-        ctx.copy_text(clipboard::branch_outline(&self.map, branch));
+        ctx.copy_text(clipboard::branches_outline(&self.map, &branches));
         if cut {
-            self.selected = Some(branch);
             self.perform(Action::Delete);
             "Cut to the clipboard".clone_into(&mut self.status);
         } else {
@@ -185,7 +189,7 @@ impl MindMapApp {
         if let Some(branches) = self.edit_map(|map| clipboard::paste(map, target, &items)) {
             self.status = format!("Pasted {} nodes", items.len());
             if let Some(&first) = branches.first() {
-                self.selected = Some(first);
+                self.select(Some(first));
                 self.reveal = Some(first);
             }
         }

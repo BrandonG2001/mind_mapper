@@ -205,6 +205,9 @@ pub enum MapError {
     /// A node cannot be moved underneath itself or one of its own descendants.
     #[error("a node cannot be moved into its own branch")]
     WouldCreateCycle,
+    /// Two nodes that were expected to share a parent do not.
+    #[error("only nodes with the same parent can swap places")]
+    NotSiblings,
 }
 
 /// Flat, serializable form of a single node.
@@ -657,6 +660,54 @@ impl MindMap {
         self.translate_subtree(id, dx, dy)
     }
 
+    /// Let two siblings trade places on screen, each with its whole branch, and swap
+    /// their order among the parent's children.
+    ///
+    /// The upper branch's visible part moves down to end where the lower one ended, and the
+    /// lower one moves up to start where the upper one started, keeping the gap between
+    /// them; so branches of different heights trade places without overlapping.
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::NodeNotFound` if either node does not exist
+    /// * `MapError::RootNode` if `a` is the root
+    /// * `MapError::NotSiblings` if the nodes are the same or have different parents
+    pub fn swap_siblings(&mut self, a: NodeId, b: NodeId) -> Result<(), MapError> {
+        let node_a = self.node(a).ok_or(MapError::NodeNotFound(a))?;
+        let parent = node_a.parent.ok_or(MapError::RootNode)?;
+        let node_b = self.node(b).ok_or(MapError::NodeNotFound(b))?;
+        if a == b || node_b.parent != Some(parent) {
+            return Err(MapError::NotSiblings);
+        }
+        let (upper, lower) = if node_a.position.y <= node_b.position.y {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let (upper_top, upper_bottom) = self.visible_span(upper);
+        let (lower_top, lower_bottom) = self.visible_span(lower);
+        self.translate_subtree(lower, 0.0, upper_top - lower_top)?;
+        self.translate_subtree(upper, 0.0, lower_bottom - upper_bottom)?;
+        let children = &mut self.node_mut(parent)?.children;
+        // Both are children of `parent`, checked above.
+        if let (Some(index_a), Some(index_b)) = (
+            children.iter().position(|&child| child == a),
+            children.iter().position(|&child| child == b),
+        ) {
+            children.swap(index_a, index_b);
+        }
+        Ok(())
+    }
+
+    /// The lowest and highest node centre (y) in the visible part of `id`'s branch.
+    fn visible_span(&self, id: NodeId) -> (f32, f32) {
+        self.walk(id, true)
+            .map(|visit| visit.node.position.y)
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(top, bottom), y| {
+                (top.min(y), bottom.max(y))
+            })
+    }
+
     /// Reflect every descendant of `id` horizontally across the vertical line `axis_x`.
     fn mirror_descendants(&mut self, id: NodeId, axis_x: f32) -> Result<(), MapError> {
         let mut stack = self
@@ -955,6 +1006,46 @@ mod tests {
         let a_x = map.node(a).expect("a").position().x;
         let child_x = map.node(a1).expect("a1").position().x;
         assert_eq!(child_x, a_x - CHILD_OFFSET_X);
+    }
+
+    #[test]
+    fn swapped_siblings_trade_places_without_overlapping() {
+        let mut map = MindMap::new("root");
+        let root = map.root();
+        let small = map
+            .add_child_at(root, "small", Point::new(100.0, 0.0))
+            .expect("root");
+        let big = map
+            .add_child_at(root, "big", Point::new(100.0, 100.0))
+            .expect("root");
+        for (index, y) in [60.0, 100.0, 140.0].into_iter().enumerate() {
+            map.add_child_at(big, &format!("big {index}"), Point::new(200.0, y))
+                .expect("big");
+        }
+        let hidden = map
+            .add_child_at(small, "hidden", Point::new(200.0, 500.0))
+            .expect("small");
+        map.set_collapsed(small, true).expect("small");
+
+        map.swap_siblings(small, big).expect("siblings");
+
+        // Big's branch (60..140, gap 60 below small) now starts where small was (0), and
+        // small ends where big's branch ended (140); hidden nodes do not count.
+        let y = |id| map.node(id).expect("live").position().y;
+        assert!((y(big) - 40.0).abs() < 1e-4, "{}", y(big));
+        assert!((y(small) - 140.0).abs() < 1e-4, "{}", y(small));
+        assert!((y(hidden) - 640.0).abs() < 1e-4, "moves with its branch");
+        assert_eq!(map.node(root).expect("root").children(), &[big, small]);
+    }
+
+    #[test]
+    fn swap_siblings_needs_two_children_of_one_parent() {
+        let (mut map, a, b, a1) = sample_map();
+        let before = map.clone();
+        assert_eq!(map.swap_siblings(a, a1), Err(MapError::NotSiblings));
+        assert_eq!(map.swap_siblings(a, a), Err(MapError::NotSiblings));
+        assert_eq!(map.swap_siblings(map.root(), b), Err(MapError::RootNode));
+        assert_eq!(map, before);
     }
 
     #[test]

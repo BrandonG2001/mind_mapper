@@ -85,13 +85,13 @@ impl MapView {
     /// * `painter` - Where to draw; its clip rectangle limits what is laid out
     /// * `visuals` - Current theme colours
     /// * `map` - The map to draw
-    /// * `selected` - Node to highlight, if any
+    /// * `selected` - Whether a node is selected (highlighted, with a fold handle)
     pub fn paint(
         &mut self,
         painter: &Painter,
         visuals: &Visuals,
         map: &MindMap,
-        selected: Option<NodeId>,
+        selected: impl Fn(NodeId) -> bool,
     ) {
         let zoom = self.camera.zoom();
         let font = FontId::proportional(BASE_FONT_SIZE * zoom);
@@ -139,10 +139,10 @@ impl MapView {
                 let galley = painter.layout_job(job);
                 let rect = Rect::from_center_size(center, galley.size() + padding * 2.0);
                 let collapsed = visit.node.is_collapsed();
-                // Collapsed nodes always show "+"; the selected node shows "-" so it can
-                // be folded with the mouse.
+                // Collapsed nodes always show "+"; selected nodes show "-" so they can be
+                // folded with the mouse.
                 let wants_handle =
-                    !visit.node.children().is_empty() && (collapsed || selected == Some(visit.id));
+                    !visit.node.children().is_empty() && (collapsed || selected(visit.id));
                 let handle = outward.filter(|_| wants_handle).map(|dir| {
                     center + Vec2::new(dir * (rect.width() * 0.5 + handle_radius * 1.4), 0.0)
                 });
@@ -162,7 +162,7 @@ impl MapView {
         let fill = visuals.window_fill();
         let selection = visuals.selection.stroke.color;
         for node in &self.layout {
-            let (border, width) = if selected == Some(node.id) {
+            let (border, width) = if selected(node.id) {
                 (selection, edge_width * 2.0)
             } else {
                 (node.accent, edge_width)
@@ -232,6 +232,14 @@ impl MapView {
             .iter()
             .rev()
             .find(|node| node.rect.contains(screen) && accept(node.id))
+            .map(|node| node.id)
+    }
+
+    /// The nodes drawn in the last [`MapView::paint`] call that overlap `area`.
+    pub fn nodes_in(&self, area: Rect) -> impl Iterator<Item = NodeId> + '_ {
+        self.layout
+            .iter()
+            .filter(move |node| node.rect.intersects(area))
             .map(|node| node.id)
     }
 
@@ -443,7 +451,7 @@ mod tests {
         view.camera_mut().pan(Vec2::new(200.0, 200.0));
 
         headless_frame(Vec2::splat(400.0), |painter, visuals| {
-            view.paint(painter, visuals, &map, None);
+            view.paint(painter, visuals, &map, |_| false);
         });
 
         assert!(view.node_rect(map.root()).is_some());
@@ -463,7 +471,7 @@ mod tests {
         view.camera_mut().pan(Vec2::new(200.0, 200.0));
 
         headless_frame(Vec2::splat(400.0), |painter, visuals| {
-            view.paint(painter, visuals, &map, None);
+            view.paint(painter, visuals, &map, |_| false);
         });
 
         // The child is drawn after (on top of) the root where they overlap.
@@ -473,6 +481,31 @@ mod tests {
             view.hit_test_where(Pos2::new(205.0, 205.0), |id| id != child),
             Some(map.root())
         );
+    }
+
+    #[test]
+    fn nodes_in_finds_nodes_touching_an_area() {
+        let mut map = MindMap::new("root");
+        let near = map
+            .add_child_at(map.root(), "near", Point::new(150.0, 0.0))
+            .expect("root exists");
+        map.add_child_at(map.root(), "far", Point::new(150.0, 150.0))
+            .expect("root exists");
+        let mut view = MapView::default();
+        view.camera_mut().pan(Vec2::new(50.0, 100.0));
+
+        headless_frame(Vec2::splat(400.0), |painter, visuals| {
+            view.paint(painter, visuals, &map, |_| false);
+        });
+
+        // A box from the root's centre to "near"'s centre touches exactly those two.
+        let root = view.node_rect(map.root()).expect("drawn").center();
+        let near_center = view.node_rect(near).expect("drawn").center();
+        let mut found: Vec<NodeId> = view
+            .nodes_in(Rect::from_two_pos(root, near_center))
+            .collect();
+        found.sort();
+        assert_eq!(found, vec![map.root(), near]);
     }
 
     #[test]
@@ -489,7 +522,7 @@ mod tests {
         view.camera_mut().pan(Vec2::new(50.0, 200.0));
 
         headless_frame(Vec2::splat(600.0), |painter, visuals| {
-            view.paint(painter, visuals, &map, None);
+            view.paint(painter, visuals, &map, |_| false);
         });
 
         assert!(view.node_rect(leaf).is_none());

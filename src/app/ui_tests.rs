@@ -242,3 +242,135 @@ fn starting_over_asks_in_the_window_before_discarding_edits() {
     assert_eq!(harness.state().screen, Screen::Editor);
     assert_eq!(harness.state().map.len(), 1);
 }
+
+/// Click node `id` while `modifiers` are held.
+fn click_with(harness: &mut Harness<'static, MindMapApp>, id: NodeId, modifiers: Modifiers) {
+    let pos = center_of(harness.state(), id);
+    harness.event(Event::ModifiersChanged(modifiers));
+    harness.hover_at(pos);
+    for pressed in [true, false] {
+        harness.event(Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        });
+    }
+    harness.event(Event::ModifiersChanged(Modifiers::NONE));
+    harness.run();
+}
+
+/// Drag with the primary button from `from` to `to` while `modifiers` are held.
+fn drag_with(
+    harness: &mut Harness<'static, MindMapApp>,
+    from: Pos2,
+    to: Pos2,
+    modifiers: Modifiers,
+) {
+    harness.event(Event::ModifiersChanged(modifiers));
+    harness.hover_at(from);
+    harness.drag_at(from);
+    harness.run();
+    // Several moves, so egui recognises a drag rather than a click.
+    for step in 1..=5_u8 {
+        let t = f32::from(step) / 5.0;
+        harness.hover_at(from + (to - from) * t);
+        harness.run();
+    }
+    harness.drop_at(to);
+    harness.run();
+    harness.event(Event::ModifiersChanged(Modifiers::NONE));
+    harness.run();
+}
+
+#[test]
+fn ctrl_click_selects_several_nodes_and_delete_removes_them() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let (risks, scope) = {
+        let app = harness.state();
+        (node_named(app, "Risks"), node_named(app, "Scope"))
+    };
+    let nodes = harness.state().map.len();
+
+    click_with(&mut harness, risks, Modifiers::NONE);
+    click_with(&mut harness, scope, Modifiers::COMMAND);
+    assert!(harness.state().is_selected(risks) && harness.state().is_selected(scope));
+    harness.key_press(Key::Delete);
+    harness.run();
+
+    // Each branch had a node plus two children.
+    assert_eq!(harness.state().map.len(), nodes - 6);
+    harness.get_by_label("Undo").click();
+    harness.run();
+    assert_eq!(harness.state().map.len(), nodes);
+}
+
+#[test]
+fn shift_drag_boxes_nodes_that_then_move_together() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let (timeline, team, mut phases) = {
+        let app = harness.state();
+        let phases = ["Phase 1", "Phase 2", "Phase 3"].map(|name| node_named(app, name));
+        (node_named(app, "Timeline"), node_named(app, "Team"), phases)
+    };
+    phases.sort_by(|&a, &b| {
+        let y = |id| center_of(harness.state(), id).y;
+        y(a).total_cmp(&y(b))
+    });
+    let [first, second, third] = phases;
+    let rect = |id| harness.state().view.node_rect(id).expect("on screen");
+    // From empty canvas beyond the leaves (away from Timeline) to inside the second one.
+    let outward = (rect(first).center().x - center_of(harness.state(), timeline).x).signum();
+    let outer_edge = if outward > 0.0 {
+        rect(first).max.x
+    } else {
+        rect(first).min.x
+    };
+    let origin = Pos2::new(outer_edge + outward * 20.0, rect(first).min.y - 4.0);
+    let end = Pos2::new(rect(second).center().x, rect(second).max.y + 4.0);
+
+    drag_with(&mut harness, origin, end, Modifiers::SHIFT);
+
+    let app = harness.state();
+    assert!(
+        app.is_selected(first) && app.is_selected(second),
+        "{}",
+        app.status
+    );
+    assert!(!app.is_selected(third));
+    assert_eq!(app.status, "2 nodes selected");
+
+    // Dragging one of them carries both onto Team.
+    let from = center_of(harness.state(), second);
+    let to = center_of(harness.state(), team);
+    drag_with(&mut harness, from, to, Modifiers::NONE);
+    let app = harness.state();
+    for id in [first, second] {
+        assert_eq!(app.map.node(id).expect("live").parent(), Some(team));
+    }
+    assert_eq!(app.map.node(third).expect("live").parent(), Some(timeline));
+}
+
+#[test]
+fn alt_down_moves_the_selected_node_below_its_sibling() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let (first, second) = {
+        let app = harness.state();
+        (
+            node_named(app, "Objective 1"),
+            node_named(app, "Objective 2"),
+        )
+    };
+    click_with(&mut harness, first, Modifiers::NONE);
+
+    harness.key_press_modifiers(Modifiers::ALT, Key::ArrowDown);
+    harness.run();
+
+    let app = harness.state();
+    assert_eq!(app.selected, Some(first));
+    let y = |id| app.map.node(id).expect("live").position().y;
+    assert!(y(second) < y(first), "{} {}", y(second), y(first));
+}

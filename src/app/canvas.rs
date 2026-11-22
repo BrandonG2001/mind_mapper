@@ -2,15 +2,16 @@
 //! right-click menu.
 
 use eframe::egui::{
-    self, Align2, Event, FontId, Key, PointerButton, Rect, Response, Sense, Ui, Vec2,
+    self, Align2, Event, FontId, Key, PointerButton, Rect, Response, Sense, StrokeKind, Ui, Vec2,
 };
 
 use super::{
     Action, Drag, EDITOR_PADDING, MIN_EDITOR_WIDTH, MindMapApp, NEW_NODE_TEXT, SCROLL_ZOOM_SPEED,
 };
-use crate::details::{self, DetailsEdit, DetailsPanel, color_palette};
+use crate::details::{self, DetailsPanel, color_palette};
 use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT};
 use crate::model::{Node, NodeId};
+use crate::navigation::{self, Direction};
 
 impl MindMapApp {
     pub(super) fn handle_zoom(&mut self, ui: &Ui, response: &Response) {
@@ -32,57 +33,78 @@ impl MindMapApp {
         }
     }
 
-    /// Selection, node dragging and panning. Uses the previous frame's layout for hit
-    /// testing, so the node under the cursor is the one the user saw.
+    /// Selection, node dragging, box selection and panning. Uses the previous frame's
+    /// layout for hit testing, so the node under the cursor is the one the user saw.
     pub(super) fn handle_pointer(&mut self, ui: &Ui, response: &Response) {
+        let modifiers = ui.input(|input| input.modifiers);
         if response.drag_started() {
-            let target = ui
+            let origin = ui
                 .input(|input| input.pointer.press_origin())
-                .filter(|_| response.dragged_by(PointerButton::Primary))
-                .and_then(|origin| self.view.hit_test(origin));
-            self.drag = Some(match target {
-                Some(id) => {
+                .filter(|_| response.dragged_by(PointerButton::Primary));
+            let target = origin.and_then(|origin| self.view.hit_test(origin));
+            self.drag = Some(match (target, origin) {
+                (Some(id), _) => {
                     // One undo step covers both the move and any re-attachment on drop.
                     self.history.record(self.map.clone());
-                    self.selected = Some(id);
-                    Drag::Node {
-                        id,
+                    // Dragging a selected node moves the whole selection with it.
+                    self.focus(id);
+                    Drag::Nodes {
+                        branches: self.selected_branches(),
                         drop_target: None,
                     }
                 }
-                None => Drag::Pan,
+                (None, Some(origin)) if modifiers.shift => Drag::Select { origin },
+                (None, _) => Drag::Pan,
             });
         }
-        if response.dragged() {
+        // `take` moves the drag out, so `self` can be borrowed freely; it is put back.
+        if response.dragged()
+            && let Some(drag) = self.drag.take()
+        {
             let delta = response.drag_delta();
-            match self.drag {
-                Some(Drag::Node { id, .. }) => {
-                    let world_delta = delta / self.view.camera().zoom();
-                    if self
-                        .map
-                        .translate_subtree(id, world_delta.x, world_delta.y)
-                        .is_ok()
-                    {
+            self.drag = Some(match drag {
+                Drag::Nodes { branches, .. } => {
+                    let world = delta / self.view.camera().zoom();
+                    let moved = branches.iter().try_for_each(|&branch| {
+                        self.map.translate_subtree(branch, world.x, world.y)
+                    });
+                    if moved.is_ok() {
                         self.mark_dirty();
                     }
                     let drop_target = response
                         .interact_pointer_pos()
-                        .and_then(|pos| self.find_drop_target(id, pos));
-                    self.drag = Some(Drag::Node { id, drop_target });
+                        .and_then(|pos| self.find_drop_target(&branches, pos));
+                    Drag::Nodes {
+                        branches,
+                        drop_target,
+                    }
                 }
-                Some(Drag::Pan) => self.view.camera_mut().pan(delta),
-                None => {}
-            }
+                Drag::Pan => {
+                    self.view.camera_mut().pan(delta);
+                    Drag::Pan
+                }
+                // `name @ pattern` keeps the whole matched value under `name`.
+                select @ Drag::Select { .. } => select,
+            });
         }
         if response.drag_stopped() {
-            if let Some(Drag::Node {
-                id,
-                drop_target: Some(new_parent),
-            }) = self.drag
-            {
-                self.reparent(id, new_parent);
+            match self.drag.take() {
+                Some(Drag::Nodes {
+                    branches,
+                    drop_target: Some(new_parent),
+                }) => self.reparent(&branches, new_parent),
+                Some(Drag::Select { origin }) => {
+                    if let Some(end) = ui.input(|input| input.pointer.latest_pos()) {
+                        let boxed: Vec<NodeId> = self
+                            .view
+                            .nodes_in(Rect::from_two_pos(origin, end))
+                            .collect();
+                        // Ctrl+Shift+drag adds to the selection.
+                        self.select_many(boxed, modifiers.command);
+                    }
+                }
+                Some(Drag::Nodes { .. } | Drag::Pan) | None => {}
             }
-            self.drag = None;
         }
 
         let pointer = response.interact_pointer_pos();
@@ -98,38 +120,63 @@ impl MindMapApp {
             self.perform_on(hit, Action::Rename);
         } else if response.clicked() {
             self.commit_edit();
-            self.selected = hit;
+            match hit {
+                Some(id) if modifiers.command => self.toggle_selected(id),
+                // Ctrl+click on empty canvas keeps the selection.
+                None if modifiers.command => {}
+                _ => self.select(hit),
+            }
         }
     }
 
-    /// The node under `screen` that `dragged` could be dropped onto: anything except the
-    /// dragged branch itself and its current parent (dropping there would change nothing).
-    pub(super) fn find_drop_target(&self, dragged: NodeId, screen: egui::Pos2) -> Option<NodeId> {
-        let current_parent = self.map.node(dragged).and_then(Node::parent);
+    /// The node under `screen` that the `dragged` branches could be dropped onto: anything
+    /// outside them, except their parent when they all share it (dropping there would
+    /// change nothing).
+    pub(super) fn find_drop_target(
+        &self,
+        dragged: &[NodeId],
+        screen: egui::Pos2,
+    ) -> Option<NodeId> {
+        let parent_of = |id: NodeId| self.map.node(id).and_then(Node::parent);
         self.view.hit_test_where(screen, |candidate| {
-            Some(candidate) != current_parent && !self.map.is_in_subtree(candidate, dragged)
+            let changes_nothing = dragged
+                .iter()
+                .all(|&branch| parent_of(branch) == Some(candidate));
+            let inside = dragged
+                .iter()
+                .any(|&branch| self.map.is_in_subtree(candidate, branch));
+            !changes_nothing && !inside
         })
     }
 
-    /// Re-attach `id` under `new_parent`. The undo point was recorded when the drag began.
-    pub(super) fn reparent(&mut self, id: NodeId, new_parent: NodeId) {
-        // Unfold the target so the dropped branch stays visible.
+    /// Re-attach the `branches` under `new_parent` (any already there stay put). The undo
+    /// point was recorded when the drag began.
+    pub(super) fn reparent(&mut self, branches: &[NodeId], new_parent: NodeId) {
+        // Unfold the target so the dropped branches stay visible.
         if self.map.node(new_parent).is_some_and(Node::is_collapsed)
             && let Err(err) = self.map.set_collapsed(new_parent, false)
         {
             self.status = err.to_string();
             return;
         }
-        match self.map.move_subtree(id, new_parent) {
+        let map = &mut self.map;
+        let moved = branches.iter().try_for_each(|&branch| {
+            if map.node(branch).and_then(Node::parent) == Some(new_parent) {
+                Ok(())
+            } else {
+                map.move_subtree(branch, new_parent)
+            }
+        });
+        match moved {
             Ok(()) => self.mark_dirty(),
             Err(err) => self.status = err.to_string(),
         }
     }
 
-    /// Select `target` (if any) and then run `action` on it.
+    /// Select only `target` (if any) and then run `action` on it.
     pub(super) fn perform_on(&mut self, target: Option<NodeId>, action: Action) {
         if target.is_some() {
-            self.selected = target;
+            self.select(target);
             self.perform(action);
         }
     }
@@ -194,8 +241,11 @@ impl MindMapApp {
         painter.rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
         self.handle_zoom(ui, &response);
         self.handle_pointer(ui, &response);
-        self.view
-            .paint(&painter, ui.visuals(), &self.map, self.selected);
+        // The closure borrows only these two fields, leaving `self.view` free to change.
+        let (main, others) = (self.selected, &self.also_selected);
+        self.view.paint(&painter, ui.visuals(), &self.map, |id| {
+            main == Some(id) || others.contains(&id)
+        });
         if let Some(search) = &self.search {
             self.view.outline_where(
                 &painter,
@@ -203,20 +253,30 @@ impl MindMapApp {
                 ui.visuals().warn_fg_color,
             );
         }
-        if let Some(Drag::Node {
-            drop_target: Some(target),
-            ..
-        }) = self.drag
-        {
-            self.view
-                .outline(&painter, target, ui.visuals().selection.stroke.color);
+        match &self.drag {
+            Some(Drag::Nodes {
+                drop_target: Some(target),
+                ..
+            }) => self
+                .view
+                .outline(&painter, *target, ui.visuals().selection.stroke.color),
+            Some(Drag::Select { origin }) => {
+                if let Some(end) = ui.input(|input| input.pointer.latest_pos()) {
+                    let selection = ui.visuals().selection;
+                    let area = Rect::from_two_pos(*origin, end);
+                    painter.rect_filled(area, 0.0, selection.bg_fill.gamma_multiply(0.25));
+                    painter.rect_stroke(area, 0.0, selection.stroke, StrokeKind::Inside);
+                }
+            }
+            Some(Drag::Nodes { .. } | Drag::Pan) | None => {}
         }
         if response.secondary_clicked() {
             self.context_node = response
                 .interact_pointer_pos()
                 .and_then(|pos| self.view.hit_test(pos));
-            if self.context_node.is_some() {
-                self.selected = self.context_node;
+            if let Some(id) = self.context_node {
+                // Right-clicking a selected node keeps the others for the menu's actions.
+                self.focus(id);
             }
         }
         if let Some(id) = self.context_node {
@@ -233,14 +293,16 @@ impl MindMapApp {
         self.show_editor(ui);
     }
 
-    /// The right-click menu of node `id`: colour, notes, rename and delete.
+    /// The right-click menu of node `id`: colour, notes, rename, reorder and delete.
+    /// Colour and delete apply to every selected node.
     pub(super) fn node_menu(&mut self, ui: &mut Ui, id: NodeId) {
         let Some(current) = self.map.node(id).map(Node::color) else {
             return;
         };
         ui.label(egui::RichText::new("Colour").strong());
         if let Some(color) = color_palette(ui, current) {
-            self.apply_details(id, &[DetailsEdit::Color(color)]);
+            self.focus(id);
+            self.color_selection(color);
             ui.close();
         }
         ui.separator();
@@ -248,19 +310,36 @@ impl MindMapApp {
             self.details.get_or_insert_with(DetailsPanel::default);
             ui.close();
         }
-        if ui.button("Rename").clicked() {
-            self.selected = Some(id);
-            self.perform(Action::Rename);
-            ui.close();
-        }
-        let deletable = id != self.map.root();
-        if ui
-            .add_enabled(deletable, egui::Button::new("Delete"))
-            .clicked()
-        {
-            self.selected = Some(id);
-            self.perform(Action::Delete);
-            ui.close();
+        let root = self.map.root();
+        let can_move = |direction| navigation::neighbor(&self.map, id, direction).is_some();
+        let menu_actions = [
+            ("Rename", Action::Rename, true, "F2"),
+            (
+                "Move up",
+                Action::Reorder(Direction::Up),
+                can_move(Direction::Up),
+                "Alt+Up",
+            ),
+            (
+                "Move down",
+                Action::Reorder(Direction::Down),
+                can_move(Direction::Down),
+                "Alt+Down",
+            ),
+            (
+                "Delete",
+                Action::Delete,
+                self.selection().any(|selected| selected != root),
+                "Delete",
+            ),
+        ];
+        for (label, action, enabled, shortcut) in menu_actions {
+            let button = egui::Button::new(label).shortcut_text(shortcut);
+            if ui.add_enabled(enabled, button).clicked() {
+                self.focus(id);
+                self.perform(action);
+                ui.close();
+            }
         }
     }
 

@@ -119,9 +119,7 @@ pub fn to_markdown(map: &MindMap) -> String {
         // A line break inside the title would end the heading early.
         out.push_str(&root_node.text().replace(['\r', '\n'], " "));
         out.push_str("\n\n");
-        for &branch in root_node.children() {
-            out.push_str(&clipboard::branch_outline(map, branch));
-        }
+        out.push_str(&clipboard::branches_outline(map, root_node.children()));
     }
     out
 }

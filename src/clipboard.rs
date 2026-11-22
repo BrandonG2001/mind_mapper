@@ -24,13 +24,22 @@ pub struct OutlineItem {
     pub link: Option<String>,
 }
 
-/// `branch` and its descendants as a bullet outline, e.g. `"- Goals\n  - Ship it\n"`.
-/// Nodes with a web link become Markdown links, `- [Goals](https://...)`.
+/// `branches` and their descendants as one bullet outline, each branch a top-level item,
+/// e.g. `"- Goals\n  - Ship it\n- Risks\n"`. Nodes with a web link become Markdown links,
+/// `- [Goals](https://...)`.
+///
+/// The branches should not contain each other (a nested one would appear twice).
 #[must_use]
-pub fn branch_outline(map: &MindMap, branch: NodeId) -> String {
+pub fn branches_outline(map: &MindMap, branches: &[NodeId]) -> String {
+    // One depth table for all branches, so the cost is O(slots + outlined nodes).
     let mut depth = vec![0_usize; map.slot_count()];
     let mut out = String::new();
-    for visit in map.subtree_preorder(branch) {
+    // `move` copies `branch` into the inner closure, which outlives this loop step.
+    let visits = branches.iter().flat_map(|&branch| {
+        map.subtree_preorder(branch)
+            .map(move |visit| (branch, visit))
+    });
+    for (branch, visit) in visits {
         let level = match visit.node.parent() {
             Some(parent) if visit.id != branch => depth[parent.index()] + 1,
             _ => 0,
@@ -201,14 +210,14 @@ mod tests {
     }
 
     #[test]
-    fn branch_outline_nests_descendants() {
+    fn outline_nests_descendants() {
         let mut map = MindMap::new("root");
         let goals = map.add_child(map.root(), "Goals").expect("root");
         let ship = map.add_child(goals, "Ship it").expect("goals");
         map.add_child(ship, "Line one\nline two").expect("ship");
 
         assert_eq!(
-            branch_outline(&map, goals),
+            branches_outline(&map, &[goals]),
             "- Goals\n  - Ship it\n    - Line one line two\n"
         );
     }
@@ -240,7 +249,7 @@ mod tests {
         let docs = map.add_child(map.root(), "Docs").expect("root");
         map.set_link(docs, Some("https://example.com/a(b)"))
             .expect("docs");
-        let outline = branch_outline(&map, docs);
+        let outline = branches_outline(&map, &[docs]);
         assert_eq!(outline, "- [Docs](https://example.com/a(b))\n");
 
         let items = parse_outline(&outline);
@@ -274,12 +283,15 @@ mod tests {
         map.add_child(goals, "Grow").expect("goals");
         let target = map.add_child(map.root(), "Target").expect("root");
 
-        let items = parse_outline(&branch_outline(&map, goals));
+        let items = parse_outline(&branches_outline(&map, &[goals]));
 
         let pasted = paste(&mut map, target, &items).expect("valid outline");
 
         assert_eq!(pasted.len(), 1);
-        assert_eq!(branch_outline(&map, pasted[0]), branch_outline(&map, goals));
+        assert_eq!(
+            branches_outline(&map, &[pasted[0]]),
+            branches_outline(&map, &[goals])
+        );
         assert_eq!(map.node(pasted[0]).expect("copy").parent(), Some(target));
     }
 

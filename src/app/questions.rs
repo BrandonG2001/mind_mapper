@@ -110,7 +110,9 @@ impl MindMapApp {
     fn continue_after(&mut self, then: AfterDiscard) {
         match then {
             AfterDiscard::Close => {
-                self.close_confirmed = true;
+                // The work is given up, so the close that follows no longer asks.
+                self.dirty = false;
+                self.autosave_pending = false;
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             AfterDiscard::PickFile => {

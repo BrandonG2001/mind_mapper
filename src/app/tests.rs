@@ -120,7 +120,7 @@ fn reparent_moves_branch_and_undo_restores_it() {
     // Dragging records the undo point before anything moves.
     app.history.record(app.map.clone());
 
-    app.reparent(child, other);
+    app.reparent(&[child], other);
 
     assert_eq!(app.map.node(child).expect("child").parent(), Some(other));
     app.perform(Action::Undo);
@@ -132,7 +132,7 @@ fn invalid_reparent_reports_error() {
     let (mut app, child) = app_with_child();
     let root = app.map.root();
 
-    app.reparent(root, child);
+    app.reparent(&[root], child);
 
     assert_eq!(app.map.node(root).expect("root").parent(), None);
     assert_eq!(app.status, MapError::RootNode.to_string());
@@ -210,7 +210,7 @@ fn dropping_onto_folded_node_unfolds_it() {
         .expect("target exists");
     app.toggle_collapse(target);
 
-    app.reparent(child, target);
+    app.reparent(&[child], target);
 
     assert!(!app.map.node(target).expect("target").is_collapsed());
     assert_eq!(app.map.node(child).expect("child").parent(), Some(target));
@@ -305,7 +305,7 @@ fn copy_cut_and_paste_branches() {
     let (mut app, child) = app_with_child();
     app.edit_map(|map| map.add_child(child, "grandchild"))
         .expect("child");
-    let outline = clipboard::branch_outline(&app.map, child);
+    let outline = clipboard::branches_outline(&app.map, &[child]);
     app.selected = Some(child);
 
     app.copy_branch(&ctx, true);
@@ -314,7 +314,7 @@ fn copy_cut_and_paste_branches() {
     app.paste_outline(&outline);
 
     let pasted = app.selected.expect("pasted branch selected");
-    assert_eq!(clipboard::branch_outline(&app.map, pasted), outline);
+    assert_eq!(clipboard::branches_outline(&app.map, &[pasted]), outline);
     assert_eq!(app.status, "Pasted 2 nodes");
     app.selected = Some(app.map.root());
     app.copy_branch(&ctx, true);
@@ -652,15 +652,13 @@ fn unsaved_work_is_kept_until_discarding_is_agreed() {
 
 #[test]
 fn closing_goes_ahead_once_discarding_is_agreed() {
-    let mut clean = MindMapApp::with_map(MindMap::new("root"));
-    clean.discard_then(AfterDiscard::Close);
-    assert!(clean.close_confirmed);
-
     let (mut app, _) = app_with_child();
     app.discard_then(AfterDiscard::Close);
-    assert!(!app.close_confirmed);
+    assert!(app.has_unsaved_work());
     app.answer(true);
-    assert!(app.close_confirmed);
+    // So the close the window then requests is not stopped to ask again.
+    assert!(!app.has_unsaved_work());
+    assert!(!app.autosave_pending);
 }
 
 #[test]
@@ -767,4 +765,147 @@ fn sync_theme_installs_chosen_theme() {
 
     assert_eq!(ctx.theme(), egui::Theme::Dark);
     assert_eq!(app.applied_theme, Some(ColorTheme::DarkBlue));
+}
+
+/// An app showing a root with three children, stacked top to bottom.
+fn app_with_three_children() -> (MindMapApp, [NodeId; 3]) {
+    let mut map = MindMap::new("root");
+    let root = map.root();
+    let ids = ["a", "b", "c"].map(|text| map.add_child(root, text).expect("root"));
+    (MindMapApp::with_map(map), ids)
+}
+
+fn y_of(app: &MindMapApp, id: NodeId) -> f32 {
+    app.map.node(id).expect("live").position().y
+}
+
+#[test]
+fn alt_arrows_move_a_node_among_its_siblings() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    app.select(Some(a));
+
+    app.perform(Action::Reorder(Direction::Down));
+    assert!(y_of(&app, b) < y_of(&app, a) && y_of(&app, a) < y_of(&app, c));
+    assert_eq!(app.selected, Some(a));
+    assert_eq!(
+        app.map.node(app.map.root()).expect("root").children(),
+        &[b, a, c]
+    );
+
+    // Up twice: the second finds nothing above and changes nothing.
+    app.perform(Action::Reorder(Direction::Up));
+    app.perform(Action::Reorder(Direction::Up));
+    assert!(y_of(&app, a) < y_of(&app, b));
+    app.perform(Action::Undo);
+    assert!(y_of(&app, b) < y_of(&app, a));
+}
+
+#[test]
+fn ctrl_click_and_boxes_build_up_a_selection() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    app.select(Some(a));
+
+    app.toggle_selected(b);
+    assert_eq!(app.selected, Some(b));
+    assert!(app.is_selected(a));
+    assert_eq!(app.status, "2 nodes selected");
+
+    // Focusing a selected node keeps the others; any other node starts over.
+    app.focus(a);
+    assert_eq!((app.selected, app.is_selected(b)), (Some(a), true));
+    app.focus(c);
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![c]);
+
+    app.select_many([a, b], true);
+    assert_eq!((app.selected, app.selection().count()), (Some(c), 3));
+    app.toggle_selected(c);
+    assert!(!app.is_selected(c));
+    assert_eq!(app.selection().count(), 2);
+    app.select_many([b], false);
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![b]);
+}
+
+#[test]
+fn selected_branches_skip_nodes_inside_other_selected_branches() {
+    let (mut app, [a, _, c]) = app_with_three_children();
+    let a1 = app.map.add_child(a, "a1").expect("a");
+    app.select(Some(c));
+    app.select_many([a1, a], true);
+
+    assert_eq!(app.selected_branches(), vec![a, c]);
+    assert_eq!(
+        clipboard::branches_outline(&app.map, &app.selected_branches()),
+        "- a\n  - a1\n- c\n"
+    );
+}
+
+#[test]
+fn deleting_a_selection_removes_every_branch_in_one_step() {
+    let (mut app, [a, _, c]) = app_with_three_children();
+    let root = app.map.root();
+    let a1 = app.map.add_child(a, "a1").expect("a");
+    app.select(Some(a1));
+    app.select_many([a, c, root], true);
+
+    app.perform(Action::Delete);
+
+    // The central idea stays; the main node's nearest survivor is selected.
+    assert_eq!(app.map.len(), 2);
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![root]);
+    app.perform(Action::Undo);
+    assert_eq!(app.map.len(), 5);
+}
+
+#[test]
+fn colouring_a_selection_colours_every_node_in_one_step() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    app.select(Some(a));
+    app.toggle_selected(c);
+    let color = details::PALETTE[2];
+
+    app.color_selection(Some(color));
+
+    let color_of = |app: &MindMapApp, id| app.map.node(id).expect("live").color();
+    assert_eq!(color_of(&app, a), Some(color));
+    assert_eq!(color_of(&app, c), Some(color));
+    assert_eq!(color_of(&app, b), None);
+    app.perform(Action::Undo);
+    assert_eq!(color_of(&app, a), None);
+    assert_eq!(color_of(&app, c), None);
+}
+
+#[test]
+fn dropping_several_branches_reattaches_them_all() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    let b1 = app.map.add_child(b, "b1").expect("b");
+    app.history.record(app.map.clone());
+
+    app.reparent(&[a, b1, c], b);
+
+    for id in [a, b1, c] {
+        assert_eq!(app.map.node(id).expect("live").parent(), Some(b));
+    }
+    // b1 was already there and was left where it was.
+    assert_eq!(app.map.node(b).expect("b").children(), &[b1, a, c]);
+}
+
+#[test]
+fn folding_or_undoing_drops_nodes_that_are_gone_from_the_selection() {
+    let (mut app, [a, b, _]) = app_with_three_children();
+    let a1 = app.map.add_child(a, "a1").expect("a");
+    app.select(Some(a1));
+    app.toggle_selected(b);
+
+    // a1 is hidden by folding a; the main node, b, stays.
+    app.toggle_collapse(a);
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![b]);
+
+    app.perform(Action::AddChild);
+    app.commit_edit();
+    let added = app.selected.expect("new node selected");
+    app.toggle_selected(b);
+    assert_eq!(app.selected, Some(b));
+    app.focus(added);
+    app.perform(Action::Undo);
+    assert_eq!(app.selection().collect::<Vec<_>>(), vec![b]);
 }
