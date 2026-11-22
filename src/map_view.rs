@@ -20,6 +20,8 @@ const MAX_LABEL_WIDTH: f32 = 240.0;
 /// Roughly how many characters fill one wrapped line; used to estimate node sizes
 /// before their text is laid out.
 const MAX_LINE_CHARS: u8 = 28;
+/// Radius of the collapse/expand handle at 100% zoom.
+const HANDLE_RADIUS: f32 = 8.0;
 /// Rounded-corner radius of node boxes at 100% zoom.
 const CORNER_RADIUS: f32 = 8.0;
 /// Accent colours cycled through for the root's branches.
@@ -39,6 +41,9 @@ struct LaidOutNode {
     rect: Rect,
     galley: Arc<Galley>,
     accent: Color32,
+    /// Centre of the collapse/expand handle, if one is drawn for this node.
+    handle: Option<Pos2>,
+    collapsed: bool,
 }
 
 /// A camera plus the screen layout of the nodes it drew last.
@@ -95,14 +100,18 @@ impl MapView {
         let cull_rect = clip.expand(MAX_LABEL_WIDTH * zoom);
 
         self.layout.clear();
-        for visit in map.preorder() {
+        let handle_radius = HANDLE_RADIUS * zoom;
+        for visit in map.visible_preorder() {
             let accent = visit.branch.map_or(text_color, |branch| {
                 BRANCH_COLORS[branch % BRANCH_COLORS.len()]
             });
             let center = self.camera.world_to_screen(visit.node.position());
+            // Which way the branch grows: away from the parent (the root has no handle).
+            let mut outward = None;
 
             if let Some(parent) = visit.node.parent().and_then(|id| map.node(id)) {
                 let start = self.camera.world_to_screen(parent.position());
+                outward = Some(if center.x >= start.x { 1.0 } else { -1.0 });
                 // The curve never leaves the box spanned by its end points.
                 if clip.intersects(Rect::from_two_pos(start, center)) {
                     let bend = Vec2::new((center.x - start.x) * 0.5, 0.0);
@@ -123,11 +132,21 @@ impl MapView {
                     MAX_LABEL_WIDTH * zoom,
                 );
                 let rect = Rect::from_center_size(center, galley.size() + padding * 2.0);
+                let collapsed = visit.node.is_collapsed();
+                // Collapsed nodes always show "+"; the selected node shows "-" so it can
+                // be folded with the mouse.
+                let wants_handle =
+                    !visit.node.children().is_empty() && (collapsed || selected == Some(visit.id));
+                let handle = outward.filter(|_| wants_handle).map(|dir| {
+                    center + Vec2::new(dir * (rect.width() * 0.5 + handle_radius * 1.4), 0.0)
+                });
                 self.layout.push(LaidOutNode {
                     id: visit.id,
                     rect,
                     galley,
                     accent,
+                    handle,
+                    collapsed,
                 });
             }
         }
@@ -153,7 +172,22 @@ impl MapView {
                 Arc::clone(&node.galley),
                 text_color,
             );
+            if let Some(handle) = node.handle {
+                paint_handle(painter, node, handle, handle_radius, fill);
+            }
         }
+    }
+
+    /// The node whose collapse/expand handle is at `screen`, from the last paint call.
+    #[must_use]
+    pub fn hit_test_handle(&self, screen: Pos2) -> Option<NodeId> {
+        // Slightly larger than drawn, so the small circle is easy to click.
+        let reach = HANDLE_RADIUS * self.camera.zoom() * 1.5;
+        self.layout
+            .iter()
+            .rev()
+            .find(|node| node.handle.is_some_and(|h| h.distance(screen) <= reach))
+            .map(|node| node.id)
     }
 
     /// The topmost node drawn at `screen` in the last [`MapView::paint`] call.
@@ -208,26 +242,54 @@ impl MapView {
     }
 }
 
-/// Estimated world-space box of a node, without laying out its text.
-fn estimated_rect(node: &Node) -> Rect {
+/// Draw a collapse/expand handle: a filled "+" disc when collapsed, an outlined "-"
+/// disc when expanded.
+fn paint_handle(
+    painter: &Painter,
+    node: &LaidOutNode,
+    center: Pos2,
+    radius: f32,
+    background: Color32,
+) {
+    let (accent, collapsed) = (node.accent, node.collapsed);
+    let (disc, mark) = if collapsed {
+        (accent, background)
+    } else {
+        (background, accent)
+    };
+    let line = Stroke::new((radius * 0.25).max(1.0), mark);
+    painter.circle(center, radius, disc, Stroke::new(line.width, accent));
+    let arm = radius * 0.5;
+    painter.line_segment([center - Vec2::X * arm, center + Vec2::X * arm], line);
+    if collapsed {
+        painter.line_segment([center - Vec2::Y * arm, center + Vec2::Y * arm], line);
+    }
+}
+
+/// Estimated world-space size of a node box with label `text`, without laying out the
+/// text (which needs the font system). Used for fitting the view and for auto-layout.
+pub(crate) fn estimated_size(text: &str) -> Vec2 {
     // Labels wrap at MAX_LABEL_WIDTH, so counting past one line changes nothing.
-    let chars = node
-        .text()
-        .chars()
-        .take(usize::from(MAX_LINE_CHARS))
-        .count();
+    let chars = text.chars().take(usize::from(MAX_LINE_CHARS)).count();
     // `take` caps the count, so this conversion cannot actually fail.
     let chars = u8::try_from(chars).unwrap_or(MAX_LINE_CHARS);
     let text_width = f32::from(chars) * MAX_LABEL_WIDTH / f32::from(MAX_LINE_CHARS);
-    let size = Vec2::new(text_width, BASE_FONT_SIZE * 1.3) + NODE_PADDING * 2.0;
-    let position = node.position();
-    Rect::from_center_size(Pos2::new(position.x, position.y), size)
+    Vec2::new(text_width, BASE_FONT_SIZE * 1.3) + NODE_PADDING * 2.0
 }
 
-/// World-space rectangle that (approximately) contains every node of `map`.
+/// Estimated world-space box of a node.
+pub(crate) fn estimated_rect(node: &Node) -> Rect {
+    let position = node.position();
+    Rect::from_center_size(
+        Pos2::new(position.x, position.y),
+        estimated_size(node.text()),
+    )
+}
+
+/// World-space rectangle that (approximately) contains every visible node of `map`.
 fn world_bounds(map: &MindMap) -> Rect {
-    map.iter().fold(Rect::NOTHING, |bounds, (_, node)| {
-        bounds.union(estimated_rect(node))
+    map.visible_preorder().fold(Rect::NOTHING, |bounds, visit| {
+        bounds.union(estimated_rect(visit.node))
     })
 }
 
@@ -295,6 +357,31 @@ mod tests {
             view.hit_test_where(Pos2::new(205.0, 205.0), |id| id != child),
             Some(map.root())
         );
+    }
+
+    #[test]
+    fn collapsed_children_are_hidden_and_handle_is_clickable() {
+        let mut map = MindMap::new("root");
+        let branch = map
+            .add_child_at(map.root(), "branch", Point::new(150.0, 0.0))
+            .expect("root exists");
+        let leaf = map
+            .add_child_at(branch, "leaf", Point::new(300.0, 0.0))
+            .expect("branch exists");
+        map.set_collapsed(branch, true).expect("branch exists");
+        let mut view = MapView::default();
+        view.camera_mut().pan(Vec2::new(50.0, 200.0));
+
+        headless_frame(Vec2::splat(600.0), |painter, visuals| {
+            view.paint(painter, visuals, &map, None);
+        });
+
+        assert!(view.node_rect(leaf).is_none());
+        let rect = view.node_rect(branch).expect("branch drawn");
+        // The handle sits just outside the node's outer (right-hand) edge.
+        let handle = Pos2::new(rect.max.x + HANDLE_RADIUS * 1.4, rect.center().y);
+        assert_eq!(view.hit_test_handle(handle), Some(branch));
+        assert_eq!(view.hit_test_handle(rect.center()), None);
     }
 
     #[test]

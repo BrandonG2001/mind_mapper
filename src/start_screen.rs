@@ -1,5 +1,7 @@
 //! The start screen: a gallery of templates to begin a new mind map from.
 
+use std::path::PathBuf;
+
 use eframe::egui::{
     self, Align, Align2, CursorIcon, FontId, Key, Layout, Modifiers, Rect, RichText, Sense,
     StrokeKind, Ui, Vec2,
@@ -16,6 +18,8 @@ const CARD_SIZE: Vec2 = Vec2::new(240.0, 210.0);
 const PREVIEW_HEIGHT: f32 = 130.0;
 /// Gap between cards and around their contents.
 const GAP: f32 = 16.0;
+/// Width of the recent-files list.
+const RECENT_WIDTH: f32 = 520.0;
 /// Rounded-corner radius of cards.
 const CARD_RADIUS: f32 = 10.0;
 
@@ -32,6 +36,19 @@ pub enum StartChoice {
     Restore,
     /// Throw the recovered work away.
     DiscardRecovery,
+    /// Open the file at this index of [`StartContext::recent`].
+    OpenRecent(usize),
+}
+
+/// What the start screen shows besides the templates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartContext<'a> {
+    /// Whether a map is already open, enabling "Back" and Escape.
+    pub can_return: bool,
+    /// Description of work recovered from a crash, if any; shows a Restore/Discard banner.
+    pub recovery: Option<&'a str>,
+    /// Recently used files, newest first.
+    pub recent: &'a [PathBuf],
 }
 
 /// Template gallery with pre-built thumbnail maps.
@@ -68,9 +85,7 @@ impl StartScreen {
     /// # Arguments
     ///
     /// * `ui` - Area to fill
-    /// * `can_return` - Whether a map is already open, enabling "Back" and Escape
-    /// * `recovery` - Description of work recovered from a crash, if any; shows a
-    ///   Restore/Discard banner
+    /// * `context` - Back button, recovery banner and recent files to show
     /// * `theme` - Colour theme, changeable from the picker at the top
     ///
     /// # Returns
@@ -79,10 +94,10 @@ impl StartScreen {
     pub fn show(
         &mut self,
         ui: &mut Ui,
-        can_return: bool,
-        recovery: Option<&str>,
+        context: &StartContext<'_>,
         theme: &mut ColorTheme,
     ) -> Option<StartChoice> {
+        let can_return = context.can_return;
         let mut choice = None;
         if can_return && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
             choice = Some(StartChoice::Back);
@@ -115,8 +130,12 @@ impl StartScreen {
                         choice = Some(StartChoice::Back);
                     }
                     ui.add_space(GAP);
-                    if let Some(description) = recovery {
+                    if let Some(description) = context.recovery {
                         choice = recovery_banner(ui, description).or(choice);
+                        ui.add_space(GAP);
+                    }
+                    if !context.recent.is_empty() {
+                        choice = recent_list(ui, context.recent).or(choice);
                         ui.add_space(GAP);
                     }
                 });
@@ -232,6 +251,36 @@ fn recovery_banner(ui: &mut Ui, description: &str) -> Option<StartChoice> {
                 choice = Some(StartChoice::DiscardRecovery);
             }
         });
+    choice
+}
+
+/// The recently used files, each a button showing the file name and its folder.
+///
+/// # Returns
+///
+/// `OpenRecent` with the index of the clicked file, if any.
+fn recent_list(ui: &mut Ui, recent: &[PathBuf]) -> Option<StartChoice> {
+    let mut choice = None;
+    ui.label(RichText::new("Recent").strong());
+    for (index, path) in recent.iter().enumerate() {
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let folder = path
+            .parent()
+            .map_or_else(String::new, |folder| folder.display().to_string());
+        let button = egui::Button::new(RichText::new(name).strong())
+            .shortcut_text(folder)
+            .min_size(Vec2::new(RECENT_WIDTH, 0.0));
+        if ui
+            .add(button)
+            .on_hover_text(path.display().to_string())
+            .clicked()
+        {
+            choice = Some(StartChoice::OpenRecent(index));
+        }
+    }
     choice
 }
 

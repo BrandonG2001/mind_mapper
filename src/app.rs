@@ -10,10 +10,12 @@ use eframe::egui::{
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
 use crate::history::History;
+use crate::layout;
 use crate::map_view::{BASE_FONT_SIZE, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
+use crate::recent::RecentFiles;
 use crate::recovery::{Recovered, RecoveryStore};
-use crate::start_screen::{StartChoice, StartScreen};
+use crate::start_screen::{StartChoice, StartContext, StartScreen};
 use crate::storage;
 use crate::theme::{ColorTheme, theme_picker};
 
@@ -47,11 +49,13 @@ enum Action {
     Rename,
     Delete,
     CenterView,
+    Tidy,
+    ToggleCollapse,
 }
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 12] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 14] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S),
         Action::SaveAs,
@@ -99,6 +103,14 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 12] = [
     (
         KeyboardShortcut::new(Modifiers::NONE, Key::Home),
         Action::CenterView,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::L),
+        Action::Tidy,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::Space),
+        Action::ToggleCollapse,
     ),
 ];
 
@@ -162,6 +174,8 @@ pub struct MindMapApp {
     autosave_pending: bool,
     /// When the last recovery copy was written, in seconds since the app started.
     last_autosave: f64,
+    /// Recently opened or saved files, shown on the start screen.
+    recent: RecentFiles,
 }
 
 impl MindMapApp {
@@ -173,13 +187,15 @@ impl MindMapApp {
     ///
     /// # Arguments
     ///
-    /// * `cc` - eframe creation context; its storage provides the saved theme
+    /// * `cc` - eframe creation context; its storage provides the saved theme and
+    ///   recent files
     /// * `initial_path` - File passed on the command line, if any. If it fails to load,
     ///   the app stays on the start screen.
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<&Path>) -> Self {
         let mut app = Self::with_map(MindMap::new(DEFAULT_ROOT_TEXT));
         app.theme = ColorTheme::load(cc.storage);
+        app.recent = RecentFiles::load(cc.storage);
         app.recovery = eframe::storage_dir(APP_NAME).map(|dir| RecoveryStore::in_dir(&dir));
         if let Some(store) = &app.recovery {
             match store.load() {
@@ -219,6 +235,7 @@ impl MindMapApp {
             deferred_open: None,
             autosave_pending: false,
             last_autosave: 0.0,
+            recent: RecentFiles::default(),
         }
     }
 
@@ -312,7 +329,14 @@ impl MindMapApp {
             }
             Action::AddChild => {
                 let parent = self.selected.unwrap_or(root);
-                if let Some(id) = self.edit_map(|map| map.add_child(parent, NEW_NODE_TEXT)) {
+                let created = self.edit_map(|map| {
+                    // A new child inside a folded branch would be invisible; unfold it.
+                    if map.node(parent).is_some_and(Node::is_collapsed) {
+                        map.set_collapsed(parent, false)?;
+                    }
+                    map.add_child(parent, NEW_NODE_TEXT)
+                });
+                if let Some(id) = created {
                     self.start_edit(id, String::new());
                 }
             }
@@ -342,6 +366,49 @@ impl MindMapApp {
                 }
             }
             Action::CenterView => self.needs_fit = true,
+            Action::Tidy => {
+                self.edit_map(layout::tidy);
+            }
+            Action::ToggleCollapse => {
+                if let Some(id) = self.selected {
+                    self.toggle_collapse(id);
+                }
+            }
+        }
+    }
+
+    /// Fold or unfold `id`'s branch (nodes without children are left alone). If the
+    /// selection disappears into a folded branch, the folded node becomes selected.
+    fn toggle_collapse(&mut self, id: NodeId) {
+        let Some(node) = self.map.node(id) else {
+            return;
+        };
+        if node.children().is_empty() {
+            return;
+        }
+        let collapse = !node.is_collapsed();
+        if self
+            .edit_map(|map| map.set_collapsed(id, collapse))
+            .is_some()
+            && collapse
+            && self
+                .selected
+                .is_some_and(|selected| self.map.is_in_subtree(selected, id))
+        {
+            self.selected = Some(id);
+        }
+    }
+
+    /// Whether the selected node can be folded or unfolded, and which label to show.
+    fn fold_state(&self) -> (bool, &'static str) {
+        let node = self
+            .selected
+            .filter(|&id| id != self.map.root())
+            .and_then(|id| self.map.node(id));
+        match node {
+            Some(node) if node.is_collapsed() => (true, "Expand"),
+            Some(node) => (!node.children().is_empty(), "Collapse"),
+            None => (false, "Collapse"),
         }
     }
 
@@ -385,6 +452,13 @@ impl MindMapApp {
                     "Restored unsaved work from the last session".clone_into(&mut self.status);
                 }
             }
+            StartChoice::OpenRecent(index) => {
+                if let Some(path) = self.recent.paths().get(index).cloned()
+                    && self.confirm_discard()
+                {
+                    self.open_path(&path);
+                }
+            }
             StartChoice::DiscardRecovery => {
                 self.recovered = None;
                 self.clear_recovery();
@@ -398,17 +472,23 @@ impl MindMapApp {
     fn open_path(&mut self, path: &Path) {
         match storage::load_from_path(path) {
             Ok(map) => {
-                self.status = format!("Opened {}", path.display());
+                self.status = format!("Opened {}", file_label(path));
+                self.recent.add(path);
                 self.replace_map(map, Some(path.to_owned()));
             }
-            Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
+            Err(err) => {
+                self.status = format!("Could not open {}: {err}", path.display());
+                // Drop dead entries (moved or deleted files) from the recent list.
+                self.recent.remove(path);
+            }
         }
     }
 
     fn save_to(&mut self, path: PathBuf) {
         match storage::save_to_path(&self.map, &path) {
             Ok(()) => {
-                self.status = format!("Saved {}", path.display());
+                self.status = format!("Saved {}", file_label(&path));
+                self.recent.add(&path);
                 self.dirty = false;
                 self.autosave_pending = false;
                 self.clear_recovery();
@@ -487,6 +567,7 @@ impl MindMapApp {
         let root = self.map.root();
         let has_selection = self.selected.is_some();
         let can_delete = self.selected.is_some_and(|id| id != root);
+        let (can_fold, fold_label) = self.fold_state();
         let buttons = [
             ("New", Action::New, true, "Ctrl+N"),
             ("Open", Action::Open, true, "Ctrl+O"),
@@ -504,6 +585,18 @@ impl MindMapApp {
             ),
             ("Delete", Action::Delete, can_delete, "Delete"),
             ("Center", Action::CenterView, true, "Home"),
+            (
+                "Tidy up",
+                Action::Tidy,
+                true,
+                "Ctrl+L: arrange the map without overlaps",
+            ),
+            (
+                fold_label,
+                Action::ToggleCollapse,
+                can_fold,
+                "Space or click the +/- handle",
+            ),
         ];
         ui.horizontal_wrapped(|ui| {
             for (label, action, enabled, hint) in buttons {
@@ -597,9 +690,15 @@ impl MindMapApp {
             self.drag = None;
         }
 
-        let hit = response
-            .interact_pointer_pos()
-            .and_then(|pos| self.view.hit_test(pos));
+        let pointer = response.interact_pointer_pos();
+        if response.clicked()
+            && let Some(id) = pointer.and_then(|pos| self.view.hit_test_handle(pos))
+        {
+            self.commit_edit();
+            self.toggle_collapse(id);
+            return;
+        }
+        let hit = pointer.and_then(|pos| self.view.hit_test(pos));
         if response.double_clicked() {
             self.perform_on(hit, Action::Rename);
         } else if response.clicked() {
@@ -619,6 +718,13 @@ impl MindMapApp {
 
     /// Re-attach `id` under `new_parent`. The undo point was recorded when the drag began.
     fn reparent(&mut self, id: NodeId, new_parent: NodeId) {
+        // Unfold the target so the dropped branch stays visible.
+        if self.map.node(new_parent).is_some_and(Node::is_collapsed)
+            && let Err(err) = self.map.set_collapsed(new_parent, false)
+        {
+            self.status = err.to_string();
+            return;
+        }
         match self.map.move_subtree(id, new_parent) {
             Ok(()) => self.mark_dirty(),
             Err(err) => self.status = err.to_string(),
@@ -736,6 +842,13 @@ impl MindMapApp {
     }
 }
 
+/// Short name for status messages: the file name, so long paths don't widen the toolbar.
+fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+}
+
 /// A file dialog pre-configured for mind-map files.
 fn file_dialog() -> FileDialog {
     FileDialog::new().add_filter(FILE_FILTER.0, FILE_FILTER.1)
@@ -745,6 +858,7 @@ impl eframe::App for MindMapApp {
     /// Called by eframe on exit and periodically, to remember settings between runs.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.theme.save(storage);
+        self.recent.save(storage);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -753,11 +867,13 @@ impl eframe::App for MindMapApp {
         self.handle_shortcuts(ui);
         if let Screen::Start { can_return } = self.screen {
             let recovery_label = self.recovered.as_ref().map(Recovered::description);
+            let context = StartContext {
+                can_return,
+                recovery: recovery_label.as_deref(),
+                recent: self.recent.paths(),
+            };
             let choice = egui::CentralPanel::default()
-                .show(ui, |ui| {
-                    self.start
-                        .show(ui, can_return, recovery_label.as_deref(), &mut self.theme)
-                })
+                .show(ui, |ui| self.start.show(ui, &context, &mut self.theme))
                 .inner;
             if let Some(choice) = choice {
                 self.choose(choice);
@@ -872,6 +988,84 @@ mod tests {
 
         assert_eq!(app.map.node(root).expect("root").parent(), None);
         assert_eq!(app.status, MapError::RootNode.to_string());
+    }
+
+    #[test]
+    fn tidy_is_one_undo_step() {
+        let (mut app, child) = app_with_child();
+        app.map
+            .set_position(child, crate::model::Point::new(-999.0, 0.0))
+            .expect("child exists");
+        let before = app.map.clone();
+
+        app.perform(Action::Tidy);
+        assert_ne!(app.map, before);
+        app.perform(Action::Undo);
+
+        assert_eq!(app.map, before);
+    }
+
+    #[test]
+    fn collapsing_moves_hidden_selection_to_folded_node() {
+        let (mut app, child) = app_with_child();
+        let grandchild = app
+            .edit_map(|map| map.add_child(child, "deep"))
+            .expect("child exists");
+        app.selected = Some(grandchild);
+
+        app.toggle_collapse(child);
+
+        assert!(app.map.node(child).expect("child").is_collapsed());
+        assert_eq!(app.selected, Some(child));
+        assert_eq!(app.fold_state(), (true, "Expand"));
+        app.perform(Action::ToggleCollapse);
+        assert!(!app.map.node(child).expect("child").is_collapsed());
+    }
+
+    #[test]
+    fn leaves_and_root_cannot_be_folded() {
+        let (mut app, child) = app_with_child();
+        app.selected = Some(child);
+        assert_eq!(app.fold_state(), (false, "Collapse"));
+        app.selected = Some(app.map.root());
+        assert_eq!(app.fold_state(), (false, "Collapse"));
+        let before = app.map.clone();
+
+        app.toggle_collapse(child);
+        app.toggle_collapse(app.map.root());
+
+        assert_eq!(app.map, before);
+    }
+
+    #[test]
+    fn adding_child_to_folded_node_unfolds_it() {
+        let (mut app, child) = app_with_child();
+        app.edit_map(|map| map.add_child(child, "deep"))
+            .expect("child exists");
+        app.toggle_collapse(child);
+        app.selected = Some(child);
+
+        app.perform(Action::AddChild);
+
+        assert!(!app.map.node(child).expect("child").is_collapsed());
+        assert_eq!(app.map.node(child).expect("child").children().len(), 2);
+    }
+
+    #[test]
+    fn dropping_onto_folded_node_unfolds_it() {
+        let (mut app, child) = app_with_child();
+        let root = app.map.root();
+        let target = app
+            .edit_map(|map| map.add_child(root, "target"))
+            .expect("root exists");
+        app.edit_map(|map| map.add_child(target, "inside"))
+            .expect("target exists");
+        app.toggle_collapse(target);
+
+        app.reparent(child, target);
+
+        assert!(!app.map.node(target).expect("target").is_collapsed());
+        assert_eq!(app.map.node(child).expect("child").parent(), Some(target));
     }
 
     #[test]
@@ -1009,6 +1203,39 @@ mod tests {
 
         assert!(!app.dirty);
         assert_eq!(store.load().expect("load succeeds"), None);
+    }
+
+    #[test]
+    fn saving_and_opening_update_recent_files() {
+        let dir = TempDir::new("app_recent");
+        let path = dir.path().join("ideas.json");
+        let (mut app, _) = app_with_child();
+
+        app.save_to(path.clone());
+        assert_eq!(app.recent.paths(), std::slice::from_ref(&path));
+        app.choose(StartChoice::OpenRecent(0));
+
+        assert_eq!(app.file_path, Some(path));
+        assert_eq!(app.screen, Screen::Editor);
+    }
+
+    #[test]
+    fn file_label_is_just_the_file_name() {
+        let path = Path::new("some").join("folder").join("ideas.json");
+
+        assert_eq!(file_label(&path), "ideas.json");
+    }
+
+    #[test]
+    fn missing_recent_file_is_removed() {
+        let dir = TempDir::new("app_recent_missing");
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+        app.recent.add(&dir.path().join("gone.json"));
+
+        app.choose(StartChoice::OpenRecent(0));
+
+        assert_eq!(app.recent.paths(), &[] as &[PathBuf]);
+        assert_eq!(app.screen, Screen::Start { can_return: false });
     }
 
     #[test]

@@ -209,29 +209,8 @@ pub fn theme_picker(ui: &mut Ui, theme: &mut ColorTheme) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-
-    /// In-memory stand-in for eframe's on-disk settings file.
-    #[derive(Default)]
-    struct MemoryStorage(HashMap<String, String>);
-
-    impl Storage for MemoryStorage {
-        fn get_string(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
-
-        fn set_string(&mut self, key: &str, value: String) {
-            self.0.insert(key.to_owned(), value);
-        }
-
-        fn remove_string(&mut self, key: &str) {
-            self.0.remove(key);
-        }
-
-        fn flush(&mut self) {}
-    }
+    use crate::test_support::MemoryStorage;
 
     #[test]
     fn saved_theme_is_loaded_back() {

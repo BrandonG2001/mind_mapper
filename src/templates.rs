@@ -1,15 +1,11 @@
 //! Built-in starting points for new mind maps.
 //!
 //! Each template is a static tree of labels. [`Template::build`] turns it into a
-//! [`MindMap`], spreading the root's branches over both sides and giving every leaf its
-//! own row so nothing overlaps.
+//! [`MindMap`], spreading the root's branches over both sides and laying it out with
+//! [`layout::tidy`].
 
+use crate::layout;
 use crate::model::{MindMap, NodeId, Point};
-
-/// Horizontal distance between tree levels in a built template.
-const COLUMN_WIDTH: f32 = 230.0;
-/// Vertical space reserved for each leaf in a built template.
-const ROW_HEIGHT: f32 = 56.0;
 
 /// One label in a template tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,74 +130,42 @@ pub const TEMPLATES: [Template; 8] = [
     },
 ];
 
-impl TemplateNode {
-    /// Number of leaves below (or including) this node, i.e. how many rows it needs.
-    fn leaf_count(&self) -> usize {
-        self.children
-            .iter()
-            .map(Self::leaf_count)
-            .sum::<usize>()
-            .max(1)
-    }
-}
-
 impl Template {
     /// Create a new mind map from this template.
     ///
     /// The first half of the root's branches go to the right, the rest to the left, and
-    /// each subtree is centred vertically on the rows of its leaves.
+    /// [`layout::tidy`] arranges everything without overlaps.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal bug: the layout reports a missing node, which cannot happen for
+    /// nodes this function has just created.
     #[must_use]
     pub fn build(&self) -> MindMap {
         let mut map = MindMap::new(self.root.text);
         let root = map.root();
-        let (right, left) = self
-            .root
-            .children
-            .split_at(self.root.children.len().div_ceil(2));
-        place_side(&mut map, root, right, 1.0);
-        place_side(&mut map, root, left, -1.0);
+        let split = self.root.children.len().div_ceil(2);
+        // Placeholder positions only tell the layout each branch's side and order.
+        let mut order = 0.0;
+        for (index, branch) in self.root.children.iter().enumerate() {
+            let side = if index < split { 1.0 } else { -1.0 };
+            add_branch(&mut map, root, branch, side, &mut order);
+        }
+        layout::tidy(&mut map).expect("every template node was just created");
         map
     }
 }
 
-/// Lay out the root's branches on one side, centred vertically on the root.
-fn place_side(map: &mut MindMap, root: NodeId, branches: &[TemplateNode], direction: f32) {
-    let rows: usize = branches.iter().map(TemplateNode::leaf_count).sum();
-    let mut top = -rows_height(rows) * 0.5;
-    for branch in branches {
-        top = place_subtree(map, root, branch, direction, top);
-    }
-}
-
-/// Add `spec` and its descendants under `parent`, starting at `top`.
-///
-/// # Returns
-///
-/// The y coordinate just below the rows this subtree used.
-fn place_subtree(
-    map: &mut MindMap,
-    parent: NodeId,
-    spec: &TemplateNode,
-    direction: f32,
-    top: f32,
-) -> f32 {
-    let height = rows_height(spec.leaf_count());
-    let parent_x = map.node(parent).map_or(0.0, |node| node.position().x);
-    let position = Point::new(parent_x + direction * COLUMN_WIDTH, top + height * 0.5);
+/// Add `spec` and its descendants under `parent`. `order` increases with each node so
+/// siblings keep the template's order when the layout sorts them top to bottom.
+fn add_branch(map: &mut MindMap, parent: NodeId, spec: &TemplateNode, side: f32, order: &mut f32) {
+    *order += 1.0;
     let id = map
-        .add_child_at(parent, spec.text, position)
+        .add_child_at(parent, spec.text, Point::new(side, *order))
         .expect("parent was created earlier in this build");
-    let mut child_top = top;
     for child in spec.children {
-        child_top = place_subtree(map, id, child, direction, child_top);
+        add_branch(map, id, child, side, order);
     }
-    top + height
-}
-
-/// Height in world units of `rows` leaf rows.
-fn rows_height(rows: usize) -> f32 {
-    // Templates are small and static; saturating keeps the conversion lossless.
-    f32::from(u16::try_from(rows).unwrap_or(u16::MAX)) * ROW_HEIGHT
 }
 
 #[cfg(test)]
@@ -241,42 +205,44 @@ mod tests {
         let map = TEMPLATES[3].build();
         let root = map.node(map.root()).expect("root exists");
 
-        let xs: Vec<f32> = root
+        let sides: Vec<bool> = root
             .children()
             .iter()
-            .map(|&id| map.node(id).expect("child exists").position().x)
+            .map(|&id| map.node(id).expect("child exists").position().x > 0.0)
             .collect();
 
-        assert_eq!(
-            xs,
-            vec![COLUMN_WIDTH, COLUMN_WIDTH, -COLUMN_WIDTH, -COLUMN_WIDTH]
-        );
+        assert_eq!(sides, vec![true, true, false, false]);
     }
 
     #[test]
-    fn nodes_in_the_same_column_do_not_overlap() {
+    fn template_order_is_kept_top_to_bottom() {
+        let map = TEMPLATES[2].build();
+        let root = map.node(map.root()).expect("root exists");
+        let ys: Vec<f32> = root.children()[..3]
+            .iter()
+            .map(|&id| map.node(id).expect("child exists").position().y)
+            .collect();
+
+        assert!(ys.windows(2).all(|pair| pair[0] < pair[1]), "{ys:?}");
+    }
+
+    #[test]
+    fn templates_have_no_overlapping_nodes() {
         for template in &TEMPLATES {
             let map = template.build();
-            let mut positions: Vec<Point> = map.iter().map(|(_, node)| node.position()).collect();
-            positions.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-
-            for pair in positions.windows(2) {
-                if (pair[0].x - pair[1].x).abs() < f32::EPSILON {
-                    assert!(
-                        pair[1].y - pair[0].y >= ROW_HEIGHT - f32::EPSILON,
-                        "{}: {pair:?} overlap",
-                        template.name
-                    );
-                }
+            let rects: Vec<_> = map
+                .iter()
+                .map(|(_, node)| crate::map_view::estimated_rect(node))
+                .collect();
+            for (index, rect) in rects.iter().enumerate() {
+                assert!(
+                    rects[index + 1..]
+                        .iter()
+                        .all(|other| !rect.shrink(0.5).intersects(other.shrink(0.5))),
+                    "{} has overlapping nodes",
+                    template.name
+                );
             }
         }
-    }
-
-    #[test]
-    fn leaf_count_counts_rows() {
-        let spec = node!("a" => [node!("b" => [node!("c"), node!("d")]), node!("e")]);
-
-        assert_eq!(spec.leaf_count(), 3);
-        assert_eq!(node!("solo").leaf_count(), 1);
     }
 }

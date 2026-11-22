@@ -17,6 +17,11 @@ keyboard, drag branches around and save your maps as plain JSON files.
   label straight away.
 - **Drag to rearrange**: moving a node moves all of its descendants with it. Drop it onto
   another node to move the whole branch under that node.
+- **Tidy up**: one click re-arranges the whole map so nothing overlaps, keeping each branch
+  on its side and siblings in their order.
+- **Collapse and expand branches** to keep large maps readable. Folded branches stay folded
+  when the map is saved.
+- **Recent files** on the start screen for quick access to the maps you use most.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
   dragging the background.
 - **Undo/redo**: up to 200 steps.
@@ -76,6 +81,7 @@ mind_mapper path/to/ideas.json
 | Rename a node | Double-click it |
 | Move a node and its branch | Drag it |
 | Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
+| Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
 
@@ -88,6 +94,8 @@ mind_mapper path/to/ideas.json
 | F2 | Rename the selected node |
 | Delete | Delete the selected node and its branch |
 | Home | Fit the whole map in the window |
+| Ctrl+L | Tidy up: arrange the map without overlaps |
+| Space | Collapse or expand the selected node's branch |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
 | Ctrl+O | Open a map |
@@ -122,13 +130,17 @@ parent by its position in the list:
 }
 ```
 
+A folded branch's node also has `"collapsed": true`. The field is omitted otherwise, so
+files from older versions load unchanged.
+
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
 
 Saving writes to a temporary file first and then swaps it into place, so a crash or full
 disk mid-save leaves the previous version intact.
 
-Settings (theme and window size) and the crash-recovery copy live in the app's data folder:
+Settings (theme, recent files and window size) and the crash-recovery copy live in the
+app's data folder:
 
 | OS | Folder |
 |---|---|
@@ -161,7 +173,9 @@ git push origin v0.2.0
 | [`src/camera.rs`](src/camera.rs) | Pan and zoom transform |
 | [`src/storage.rs`](src/storage.rs) | JSON load and save, atomic file writes |
 | [`src/recovery.rs`](src/recovery.rs) | Background copy of unsaved work for crash recovery |
-| [`src/templates.rs`](src/templates.rs) | Built-in templates and their automatic layout |
+| [`src/templates.rs`](src/templates.rs) | Built-in templates |
+| [`src/layout.rs`](src/layout.rs) | Automatic, overlap-free layout (Tidy up, templates) |
+| [`src/recent.rs`](src/recent.rs) | The recent-files list |
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |
 | [`src/start_screen.rs`](src/start_screen.rs) | The template gallery |
 | [`src/theme.rs`](src/theme.rs) | Colour themes and saving the chosen one |

@@ -19,6 +19,15 @@ const SIBLING_OFFSET_Y: f32 = 70.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(usize);
 
+impl NodeId {
+    /// Position of the node's slot, for per-node lookup tables sized by
+    /// [`MindMap::slot_count`].
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// A 2D point in world (map) coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Point {
@@ -43,6 +52,8 @@ pub struct Node {
     position: Point,
     parent: Option<NodeId>,
     children: Vec<NodeId>,
+    /// When true, the node's descendants are hidden.
+    collapsed: bool,
 }
 
 impl Node {
@@ -68,6 +79,12 @@ impl Node {
     #[must_use]
     pub fn children(&self) -> &[NodeId] {
         &self.children
+    }
+
+    /// Whether the node's descendants are hidden.
+    #[must_use]
+    pub const fn is_collapsed(&self) -> bool {
+        self.collapsed
     }
 }
 
@@ -112,6 +129,17 @@ pub struct NodeRecord {
     pub text: String,
     /// Node centre in world coordinates.
     pub position: Point,
+    /// Whether the node's descendants are hidden. Omitted from the file when false, and
+    /// treated as false when absent, so files from older versions still load.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub collapsed: bool,
+}
+
+/// `serde` helper: skip writing a `false` flag.
+// serde passes the field by reference, so this cannot take `bool` by value.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// A node visited by [`MindMap::preorder`].
@@ -147,6 +175,7 @@ impl MindMap {
             position: Point::default(),
             parent: None,
             children: Vec::new(),
+            collapsed: false,
         };
         Self {
             slots: vec![Some(root)],
@@ -206,22 +235,40 @@ impl MindMap {
     ///
     /// An iterator over [`Visit`]s, starting with the root.
     pub fn preorder(&self) -> impl Iterator<Item = Visit<'_>> {
+        self.walk(false)
+    }
+
+    /// Like [`MindMap::preorder`], but skips the descendants of collapsed nodes: exactly
+    /// the nodes that are on screen.
+    pub fn visible_preorder(&self) -> impl Iterator<Item = Visit<'_>> {
+        self.walk(true)
+    }
+
+    fn walk(&self, skip_collapsed: bool) -> impl Iterator<Item = Visit<'_>> {
         // An explicit stack instead of recursion, so deep trees cannot overflow the
         // call stack.
         let mut stack = vec![(self.root, None)];
         std::iter::from_fn(move || {
             let (id, branch) = stack.pop()?;
             let node = self.node(id)?;
-            // Push in reverse so the first child is popped (visited) first.
-            stack.extend(
-                node.children
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(index, &child)| (child, branch.or(Some(index)))),
-            );
+            if !(skip_collapsed && node.collapsed) {
+                // Push in reverse so the first child is popped (visited) first.
+                stack.extend(
+                    node.children
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(index, &child)| (child, branch.or(Some(index)))),
+                );
+            }
             Some(Visit { id, node, branch })
         })
+    }
+
+    /// Size for per-node lookup tables indexed by [`NodeId::index`] (counts free slots).
+    #[must_use]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 
     /// Add a new child under `parent`, placed next to its existing children.
@@ -271,6 +318,7 @@ impl MindMap {
             position,
             parent: Some(parent),
             children: Vec::new(),
+            collapsed: false,
         };
         let id = if let Some(index) = self.free.pop() {
             self.slots[index] = Some(node);
@@ -344,6 +392,30 @@ impl MindMap {
         // Reuses the existing String allocation when it is large enough.
         node.text.clear();
         node.text.push_str(text);
+        Ok(())
+    }
+
+    /// Place a single node (not its descendants) at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_position(&mut self, id: NodeId, position: Point) -> Result<(), MapError> {
+        self.node_mut(id)?.position = position;
+        Ok(())
+    }
+
+    /// Hide (`true`) or show (`false`) a node's descendants.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist and `MapError::RootNode`
+    /// for the root, whose branches spread to both sides and cannot fold one way.
+    pub fn set_collapsed(&mut self, id: NodeId, collapsed: bool) -> Result<(), MapError> {
+        if id == self.root {
+            return Err(MapError::RootNode);
+        }
+        self.node_mut(id)?.collapsed = collapsed;
         Ok(())
     }
 
@@ -488,6 +560,7 @@ impl MindMap {
                 parent: visit.node.parent.map(|parent| index_of[parent.0]),
                 text: visit.node.text.clone(),
                 position: visit.node.position,
+                collapsed: visit.node.collapsed,
             });
         }
         records
@@ -525,6 +598,7 @@ impl MindMap {
                 position: record.position,
                 parent,
                 children: Vec::new(),
+                collapsed: record.collapsed,
             }));
         }
         Ok(Self {
@@ -778,6 +852,49 @@ mod tests {
     }
 
     #[test]
+    fn visible_preorder_skips_collapsed_descendants() {
+        let (mut map, a, b, a1) = sample_map();
+
+        map.set_collapsed(a, true).expect("a exists");
+
+        let visible: Vec<NodeId> = map.visible_preorder().map(|visit| visit.id).collect();
+        assert_eq!(visible, vec![map.root(), a, b]);
+        assert!(map.node(a).expect("a").is_collapsed());
+        assert_eq!(map.preorder().count(), 4);
+        assert!(map.preorder().any(|visit| visit.id == a1));
+    }
+
+    #[test]
+    fn root_cannot_be_collapsed() {
+        let mut map = MindMap::new("root");
+
+        assert_eq!(map.set_collapsed(map.root(), true), Err(MapError::RootNode));
+    }
+
+    #[test]
+    fn collapsed_flag_survives_records() {
+        let (mut map, a, _, _) = sample_map();
+        map.set_collapsed(a, true).expect("a exists");
+
+        let rebuilt = MindMap::from_records(map.to_records()).expect("records are valid");
+
+        // Rebuilding renumbers nodes in tree order, so compare the saved form.
+        assert_eq!(rebuilt.to_records(), map.to_records());
+        assert!(rebuilt.to_records().iter().any(|record| record.collapsed));
+    }
+
+    #[test]
+    fn set_position_moves_only_that_node() {
+        let (mut map, a, _, a1) = sample_map();
+        let child_before = map.node(a1).expect("a1").position();
+
+        map.set_position(a, Point::new(5.0, 6.0)).expect("a exists");
+
+        assert_eq!(map.node(a).expect("a").position(), Point::new(5.0, 6.0));
+        assert_eq!(map.node(a1).expect("a1").position(), child_before);
+    }
+
+    #[test]
     fn iter_yields_every_live_node() {
         let (map, _, _, _) = sample_map();
 
@@ -802,6 +919,7 @@ mod tests {
             parent,
             text: String::new(),
             position: Point::default(),
+            collapsed: false,
         };
 
         assert_eq!(MindMap::from_records(Vec::new()), Err(MapError::Empty));

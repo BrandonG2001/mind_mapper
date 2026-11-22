@@ -1,7 +1,28 @@
 //! Helpers shared by unit tests.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// In-memory stand-in for eframe's on-disk settings file.
+#[derive(Default)]
+pub struct MemoryStorage(HashMap<String, String>);
+
+impl eframe::Storage for MemoryStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_owned(), value);
+    }
+
+    fn remove_string(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    fn flush(&mut self) {}
+}
 
 /// A fresh, empty directory under the system temp folder, deleted when dropped.
 ///
