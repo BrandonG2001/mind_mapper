@@ -2,8 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
+use rfd::FileDialog;
 
+use super::questions::Question;
 use super::{FILE_FILTER, MindMapApp, file_label};
 use crate::background::Job;
 use crate::export::{self, ExportStyle};
@@ -47,15 +48,17 @@ impl MindMapApp {
     }
 
     /// Save the map to `path`, first asking if that would overwrite changes another window
-    /// or program made to the file.
+    /// or program made to the file (then the save happens once the user agrees).
     pub(super) fn save_to(&mut self, path: PathBuf) {
-        if self.would_overwrite_changes(&path) && !confirm_overwrite(&path) {
-            self.status = format!(
-                "Not saved: {} was changed elsewhere; use Save As to keep both versions",
-                file_label(&path)
-            );
-            return;
+        if self.would_overwrite_changes(&path) {
+            self.question = Some(Question::Overwrite(path));
+        } else {
+            self.write_to(path);
         }
+    }
+
+    /// Save the map to `path` without asking, and report the result in the status line.
+    pub(super) fn write_to(&mut self, path: PathBuf) {
         match storage::save_to_path(&self.map, &path) {
             Ok(stamp) => {
                 self.file_stamp = Some(stamp);
@@ -118,48 +121,6 @@ impl MindMapApp {
         });
         self.exports.push((name, job));
     }
-
-    /// Ask before throwing away unsaved (or recovered) work. If the user agrees, the
-    /// recovery copy is deleted too.
-    ///
-    /// # Returns
-    ///
-    /// `true` if it is fine to continue.
-    pub(super) fn confirm_discard(&mut self) -> bool {
-        let has_unsaved = self.dirty || self.recovered.is_some();
-        if !has_unsaved {
-            return true;
-        }
-        let discard = MessageDialog::new()
-            .set_title("Unsaved changes")
-            .set_description("Discard the unsaved changes to this mind map?")
-            .set_buttons(MessageButtons::YesNo)
-            .show()
-            == MessageDialogResult::Yes;
-        if discard {
-            self.discard_orphan();
-            self.clear_recovery();
-            // If the current map stays open (e.g. the file dialog is cancelled), keep
-            // protecting it.
-            self.autosave_pending = self.dirty;
-        }
-        discard
-    }
-}
-
-/// Ask whether to replace a file that changed on disk since this window read it.
-fn confirm_overwrite(path: &Path) -> bool {
-    MessageDialog::new()
-        .set_title("File changed on disk")
-        .set_description(format!(
-            "{} was changed by another window or program after you opened it.\n\n\
-             Save anyway and replace those changes with this version? \
-             (Choose No, then Save As, to keep both.)",
-            file_label(path)
-        ))
-        .set_buttons(MessageButtons::YesNo)
-        .show()
-        == MessageDialogResult::Yes
 }
 
 /// A file dialog pre-configured for mind-map files.

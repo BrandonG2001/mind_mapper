@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Ui};
 
+use super::questions::AfterDiscard;
 use super::{Action, MindMapApp, Screen};
 use crate::details::DetailsEdit;
 use crate::model::NodeId;
@@ -14,13 +15,7 @@ impl MindMapApp {
     /// Act on a start-screen choice.
     pub(super) fn choose(&mut self, choice: StartChoice) {
         match choice {
-            StartChoice::Template(index) => {
-                if let Some(map) = self.start.template_map(index)
-                    && self.confirm_discard()
-                {
-                    self.replace_map(map, None);
-                }
-            }
+            StartChoice::Template(index) => self.discard_then(AfterDiscard::Template(index)),
             StartChoice::Open => self.perform(Action::Open),
             StartChoice::Back => self.screen = Screen::Editor,
             StartChoice::Restore => {
@@ -43,10 +38,8 @@ impl MindMapApp {
                 }
             }
             StartChoice::OpenRecent(index) => {
-                if let Some(path) = self.recent.paths().get(index).cloned()
-                    && self.confirm_discard()
-                {
-                    self.open_path(&path);
+                if let Some(path) = self.recent.paths().get(index).cloned() {
+                    self.discard_then(AfterDiscard::OpenPath(path));
                 }
             }
             StartChoice::DiscardRecovery => {

@@ -19,12 +19,14 @@ use crate::settings::{Settings, SettingsFile};
 use crate::start_screen::{StartContext, StartScreen};
 use crate::storage::{FileStamp, StorageError};
 use crate::theme::{self, ColorTheme};
+use questions::{AfterDiscard, Question};
 
 mod autosave;
 mod canvas;
 mod editing;
 mod files;
 mod panels;
+mod questions;
 
 /// Application name: window title, and the folder name for settings and recovery data.
 pub const APP_NAME: &str = "Mind Mapper";
@@ -241,6 +243,10 @@ pub struct MindMapApp {
     recovered: Option<Recovered>,
     /// A command-line file held back until the recovered work has been dealt with.
     deferred_open: Option<PathBuf>,
+    /// A question shown over the window, waiting for the user's answer.
+    question: Option<Question>,
+    /// The user agreed to discard unsaved work and close, so the next close goes ahead.
+    close_confirmed: bool,
     /// The map changed since the last recovery copy was written.
     autosave_pending: bool,
     /// When the last recovery copy was written, in seconds since the app started.
@@ -350,6 +356,8 @@ impl MindMapApp {
             recovery: None,
             recovered: None,
             deferred_open: None,
+            question: None,
+            close_confirmed: false,
             autosave_pending: false,
             last_autosave: 0.0,
             recent: RecentFiles::default(),
@@ -386,13 +394,7 @@ impl MindMapApp {
                 }
                 self.screen = Screen::Start { can_return: true };
             }
-            Action::Open => {
-                if self.confirm_discard()
-                    && let Some(path) = files::file_dialog().pick_file()
-                {
-                    self.open_path(&path);
-                }
-            }
+            Action::Open => self.discard_then(AfterDiscard::PickFile),
             Action::Save => match self.file_path.clone() {
                 Some(path) => self.save_to(path),
                 None => self.perform(Action::SaveAs),
@@ -513,8 +515,12 @@ impl MindMapApp {
             self.ui_zoom = zoom;
             self.update_settings(|settings| settings.ui_zoom = zoom);
         }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.confirm_discard() {
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.close_confirmed
+            && self.has_unsaved_work()
+        {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.question = Some(Question::Discard(AfterDiscard::Close));
         }
         let title = self.title();
         if title != self.window_title {
@@ -524,8 +530,10 @@ impl MindMapApp {
     }
 
     fn handle_shortcuts(&mut self, ui: &Ui) {
-        // While a text field has focus, keys (and Ctrl+C/X/V) belong to it.
-        if self.editing.is_some() || ui.ctx().egui_wants_keyboard_input() {
+        // While a text field has focus, keys (and Ctrl+C/X/V) belong to it; while a
+        // question is open, they belong to the question.
+        if self.editing.is_some() || self.question.is_some() || ui.ctx().egui_wants_keyboard_input()
+        {
             return;
         }
         let ctx = ui.ctx();
@@ -578,6 +586,8 @@ fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
 impl eframe::App for MindMapApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_window(ui);
+        // Before the panels, so they already ignore clicks while a question is open.
+        self.show_question(ui.ctx());
         self.poll_jobs();
         self.autosave(ui.ctx());
         self.handle_shortcuts(ui);

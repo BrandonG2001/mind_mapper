@@ -596,6 +596,74 @@ fn restored_work_asks_before_overwriting_its_file() {
 }
 
 #[test]
+fn saving_over_changes_made_elsewhere_waits_for_an_answer() {
+    let dir = TempDir::new("app_overwrite_question");
+    let path = dir.path().join("shared.json");
+    storage::save_to_path(&MindMap::new("shared"), &path).expect("save succeeds");
+    let mut app = MindMapApp::with_map(MindMap::new("root"));
+    app.open_path(&path);
+    let elsewhere =
+        storage::save_to_path(&MindMap::new("changed elsewhere"), &path).expect("save succeeds");
+
+    app.save_to(path.clone());
+    assert_eq!(app.question, Some(Question::Overwrite(path.clone())));
+    app.answer(false);
+    assert!(app.status.starts_with("Not saved"), "{}", app.status);
+    assert_eq!(
+        storage::current_stamp(&path).expect("readable"),
+        Some(elsewhere)
+    );
+
+    app.save_to(path.clone());
+    app.answer(true);
+    assert!(app.question.is_none());
+    assert_eq!(app.status, "Saved shared.json");
+    let (saved, _) = storage::load_from_path(&path).expect("loads");
+    assert_eq!(saved.node(saved.root()).expect("root").text(), "shared");
+}
+
+#[test]
+fn unsaved_work_is_kept_until_discarding_is_agreed() {
+    let dir = TempDir::new("app_discard_question");
+    let path = dir.path().join("other.json");
+    storage::save_to_path(&MindMap::new("other"), &path).expect("save succeeds");
+    let (mut app, _) = app_with_child();
+    assert!(app.dirty);
+
+    app.discard_then(AfterDiscard::OpenPath(path.clone()));
+    assert_eq!(
+        app.question,
+        Some(Question::Discard(AfterDiscard::OpenPath(path.clone())))
+    );
+    app.answer(false);
+    assert!(app.question.is_none());
+    assert_eq!(app.map.len(), 2);
+
+    app.discard_then(AfterDiscard::OpenPath(path.clone()));
+    app.answer(true);
+    assert_eq!(app.file_path.as_deref(), Some(path.as_path()));
+    assert_eq!(app.map.len(), 1);
+
+    // Nothing unsaved now, so nothing to ask.
+    app.discard_then(AfterDiscard::Template(0));
+    assert!(app.question.is_none());
+    assert_eq!(app.file_path, None);
+}
+
+#[test]
+fn closing_goes_ahead_once_discarding_is_agreed() {
+    let mut clean = MindMapApp::with_map(MindMap::new("root"));
+    clean.discard_then(AfterDiscard::Close);
+    assert!(clean.close_confirmed);
+
+    let (mut app, _) = app_with_child();
+    app.discard_then(AfterDiscard::Close);
+    assert!(!app.close_confirmed);
+    app.answer(true);
+    assert!(app.close_confirmed);
+}
+
+#[test]
 fn saving_removes_recovery_copy() {
     let dir = TempDir::new("app_save_clears");
     let (mut app, _) = app_with_child();

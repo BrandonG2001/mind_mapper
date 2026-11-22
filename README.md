@@ -56,7 +56,8 @@ keyboard, drag branches around and save your maps as plain JSON files.
       libxkbcommon-dev libssl-dev
   ```
 
-  File dialogs use the XDG desktop portal, which most desktop environments provide.
+  File dialogs use the XDG desktop portal, which most desktop environments provide
+  (without it, they fall back to `zenity` if that is installed).
 
 ### Download
 
@@ -127,7 +128,8 @@ On the template gallery, Esc returns to the map you were editing.
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
 work is discarded by opening another map, choosing a template or closing the window. If
 another window or program changed the file since you opened it, saving asks before
-replacing those changes.
+replacing those changes. These questions appear inside the window; Esc or a click outside
+them cancels.
 
 ### Crash recovery
 
@@ -235,6 +237,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/editing.rs`](src/app/editing.rs) | Undoable edits, folding, navigation, clipboard |
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
 | [`src/app/files.rs`](src/app/files.rs) | Open, save (with the overwrite check), export, settings |
+| [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |
 
 ### Changing the icon

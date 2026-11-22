@@ -212,3 +212,33 @@ fn notes_panel_opens_for_the_selected_node() {
     let color = harness.state().map.node(goals).expect("goals").color();
     assert_eq!(color.map(String::from).as_deref(), Some("#edc948"));
 }
+
+#[test]
+fn starting_over_asks_in_the_window_before_discarding_edits() {
+    let mut harness = harness();
+    open_template(&mut harness, "Blank");
+    harness.key_press(Key::Tab);
+    harness.run();
+    harness.key_press(Key::Enter);
+    harness.run();
+    assert!(harness.state().dirty);
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::N);
+    harness.run();
+
+    // Regression check: the question was a system message box, which on Linux without
+    // `zenity` never appeared and counted as "no", so unsaved windows could not close.
+    harness.get_by_label("Blank").click();
+    harness.run();
+    harness.get_by_label("Discard the unsaved changes to this mind map?");
+    harness.get_by_label("Cancel").click();
+    harness.run();
+    assert!(harness.state().question.is_none());
+    assert_eq!(harness.state().map.len(), 2);
+
+    harness.get_by_label("Blank").click();
+    harness.run();
+    harness.get_by_label("Discard changes").click();
+    harness.run();
+    assert_eq!(harness.state().screen, Screen::Editor);
+    assert_eq!(harness.state().map.len(), 1);
+}
