@@ -4,12 +4,12 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    Color32, FontId, Galley, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, Visuals,
-    epaint::CubicBezierShape,
+    Align, Color32, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, Visuals,
+    epaint::CubicBezierShape, text::LayoutJob,
 };
 
 use crate::camera::Camera;
-use crate::model::{MindMap, Node, NodeId};
+use crate::model::{MindMap, Node, NodeColor, NodeId, Visit};
 
 /// Font size of node labels at 100% zoom.
 pub const BASE_FONT_SIZE: f32 = 16.0;
@@ -44,6 +44,8 @@ struct LaidOutNode {
     /// Centre of the collapse/expand handle, if one is drawn for this node.
     handle: Option<Pos2>,
     collapsed: bool,
+    /// The node has notes or a link, shown by a folded corner.
+    has_details: bool,
 }
 
 /// A camera plus the screen layout of the nodes it drew last.
@@ -52,6 +54,8 @@ pub struct MapView {
     camera: Camera,
     /// Reused every frame to avoid reallocating.
     layout: Vec<LaidOutNode>,
+    /// Reused every frame to avoid reallocating.
+    accents: Accents,
 }
 
 impl MapView {
@@ -100,9 +104,10 @@ impl MapView {
         let cull_rect = clip.expand(MAX_LABEL_WIDTH * zoom);
 
         self.layout.clear();
+        self.accents.reset(map);
         let handle_radius = HANDLE_RADIUS * zoom;
         for visit in map.visible_preorder() {
-            let accent = branch_accent(visit.branch, text_color);
+            let accent = self.accents.resolve(map, &visit, text_color);
             let center = self.camera.world_to_screen(visit.node.position());
             // Which way the branch grows: away from the parent (the root has no handle).
             let mut outward = None;
@@ -123,12 +128,15 @@ impl MapView {
             }
 
             if cull_rect.contains(center) {
-                let galley = painter.layout(
+                let mut job = LayoutJob::simple(
                     visit.node.text().to_owned(),
                     font.clone(),
                     text_color,
                     MAX_LABEL_WIDTH * zoom,
                 );
+                // Centre each line of a multi-line label, like the editor and exports.
+                job.halign = Align::Center;
+                let galley = painter.layout_job(job);
                 let rect = Rect::from_center_size(center, galley.size() + padding * 2.0);
                 let collapsed = visit.node.is_collapsed();
                 // Collapsed nodes always show "+"; the selected node shows "-" so it can
@@ -145,6 +153,7 @@ impl MapView {
                     accent,
                     handle,
                     collapsed,
+                    has_details: !visit.node.note().is_empty() || visit.node.link().is_some(),
                 });
             }
         }
@@ -165,11 +174,27 @@ impl MapView {
                 Stroke::new(width, border),
                 StrokeKind::Inside,
             );
+            // A centred galley's lines are laid out around x = 0, so align its own
+            // bounding box (not its origin) with the node's centre.
             painter.galley(
-                node.rect.center() - node.galley.size() * 0.5,
+                node.rect.center() - node.galley.rect.center().to_vec2(),
                 Arc::clone(&node.galley),
                 text_color,
             );
+            if node.has_details {
+                // A small folded corner at the top right, like a dog-eared page.
+                let corner = node.rect.right_top();
+                let size = CORNER_RADIUS * zoom * 1.3;
+                painter.add(Shape::convex_polygon(
+                    vec![
+                        corner + Vec2::new(-size, 0.0),
+                        corner,
+                        corner + Vec2::new(0.0, size),
+                    ],
+                    node.accent,
+                    Stroke::NONE,
+                ));
+            }
             if let Some(handle) = node.handle {
                 paint_handle(painter, node, handle, handle_radius, fill);
             }
@@ -276,23 +301,62 @@ fn paint_handle(
     }
 }
 
-/// Colour of a branch's edges and borders: `root_color` for the root itself, otherwise
-/// one of the branch colours, cycling by the index of the root's child it descends from.
-pub(crate) fn branch_accent(branch: Option<usize>, root_color: Color32) -> Color32 {
-    branch.map_or(root_color, |branch| {
-        BRANCH_COLORS[branch % BRANCH_COLORS.len()]
-    })
+/// Works out the accent colour (border and incoming edge) of each node during a
+/// pre-order walk: a node's own colour if it has one, otherwise its parent's accent, and
+/// for the root's children the automatic branch colour.
+#[derive(Debug, Default)]
+pub(crate) struct Accents(Vec<Color32>);
+
+impl Accents {
+    /// Prepare for a walk over `map`.
+    pub(crate) fn reset(&mut self, map: &MindMap) {
+        self.0.clear();
+        self.0.resize(map.slot_count(), Color32::TRANSPARENT);
+    }
+
+    /// The accent of `visit`. Its parent must have been resolved first, which a pre-order
+    /// walk guarantees.
+    pub(crate) fn resolve(
+        &mut self,
+        map: &MindMap,
+        visit: &Visit<'_>,
+        root_color: Color32,
+    ) -> Color32 {
+        let inherited = match visit.node.parent() {
+            None => root_color,
+            Some(parent) if parent == map.root() => {
+                let branch = visit.branch.unwrap_or(0);
+                BRANCH_COLORS[branch % BRANCH_COLORS.len()]
+            }
+            Some(parent) => self.0[parent.index()],
+        };
+        let accent = visit.node.color().map_or(inherited, to_color32);
+        self.0[visit.id.index()] = accent;
+        accent
+    }
+}
+
+/// The egui colour for a node colour.
+pub(crate) fn to_color32(color: NodeColor) -> Color32 {
+    let [r, g, b] = color.components();
+    Color32::from_rgb(r, g, b)
 }
 
 /// Height of one line of label text at 100% zoom.
 pub(crate) const LINE_HEIGHT: f32 = BASE_FONT_SIZE * 1.3;
 
-/// Split a label into lines of at most `MAX_LINE_CHARS` characters, breaking at spaces
-/// where possible (a single word longer than a line is split). Approximates how the
-/// canvas wraps labels, without needing the font system.
+/// Split a label into display lines: every typed line break starts a new line, and lines
+/// longer than `MAX_LINE_CHARS` characters wrap, at spaces where possible (a single word
+/// longer than a line is split). Approximates how the canvas wraps labels, without
+/// needing the font system. Blank lines are skipped.
 pub(crate) fn wrap_label(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().flat_map(wrap_line)
+}
+
+/// Wrap one typed line (see [`wrap_label`]).
+fn wrap_line(line: &str) -> impl Iterator<Item = &str> {
     let max = usize::from(MAX_LINE_CHARS);
-    let mut rest = text.trim();
+    let mut rest = line.trim();
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;
@@ -463,12 +527,48 @@ mod tests {
     }
 
     #[test]
+    fn typed_line_breaks_start_new_lines() {
+        let lines: Vec<&str> = wrap_label("first line\nsecond\r\n\nthird").collect();
+
+        assert_eq!(lines, ["first line", "second", "third"]);
+        assert!(estimated_size("a\nb").y > estimated_size("a b").y);
+    }
+
+    #[test]
     fn longer_labels_are_estimated_wider_then_taller() {
         let short = estimated_size("hi");
         let long = estimated_size(&"word ".repeat(20));
 
         assert!(long.x > short.x);
         assert!(long.y > short.y);
+    }
+
+    #[test]
+    fn own_colours_override_and_are_inherited() {
+        let mut map = MindMap::new("root");
+        let branch = map.add_child(map.root(), "branch").expect("root");
+        let child = map.add_child(branch, "child").expect("branch");
+        let grandchild = map.add_child(child, "grandchild").expect("child");
+        let other = map.add_child(map.root(), "other").expect("root");
+        let red = NodeColor::rgb(255, 0, 0);
+        let blue = NodeColor::rgb(0, 0, 255);
+        map.set_color(child, Some(red)).expect("child");
+        map.set_color(grandchild, Some(blue)).expect("grandchild");
+        let root_color = Color32::WHITE;
+
+        let mut accents = Accents::default();
+        accents.reset(&map);
+        let resolved: Vec<(NodeId, Color32)> = map
+            .preorder()
+            .map(|visit| (visit.id, accents.resolve(&map, &visit, root_color)))
+            .collect();
+
+        let accent = |id| resolved.iter().find(|(n, _)| *n == id).expect("visited").1;
+        assert_eq!(accent(map.root()), root_color);
+        assert_eq!(accent(branch), BRANCH_COLORS[0]);
+        assert_eq!(accent(child), to_color32(red));
+        assert_eq!(accent(grandchild), to_color32(blue));
+        assert_eq!(accent(other), BRANCH_COLORS[1]);
     }
 
     #[test]

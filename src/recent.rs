@@ -17,18 +17,13 @@ pub struct RecentFiles {
 }
 
 impl RecentFiles {
-    /// Read the list saved by [`RecentFiles::save`]; empty if there is none or it is
-    /// unreadable.
+    /// Read the list that versions before 0.5 kept in eframe's storage (used once, to
+    /// carry it over into the shared settings file); empty if there is none.
     #[must_use]
     pub fn load(storage: Option<&dyn Storage>) -> Self {
         storage
             .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
             .unwrap_or_default()
-    }
-
-    /// Remember the list in eframe's settings storage.
-    pub fn save(&self, storage: &mut dyn Storage) {
-        eframe::set_value(storage, STORAGE_KEY, self);
     }
 
     /// The remembered files, newest first.
@@ -105,7 +100,7 @@ mod tests {
         let mut recent = RecentFiles::default();
         recent.add(Path::new("a.json"));
 
-        recent.save(&mut storage);
+        eframe::set_value(&mut storage, STORAGE_KEY, &recent);
 
         assert_eq!(RecentFiles::load(Some(&storage)), recent);
         assert_eq!(RecentFiles::load(None), RecentFiles::default());

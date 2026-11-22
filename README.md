@@ -23,7 +23,8 @@ keyboard, drag branches around and save your maps as plain JSON files.
   when the map is saved.
 - **Recent files** on the start screen for quick access to the maps you use most.
 - **Export** to a PNG image, an SVG drawing or a Markdown outline.
-- **Find** any node by its text; matches are highlighted and folded branches open as needed.
+- **Find** any node by its text or notes; matches are highlighted and folded branches open
+  as needed.
 - **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
   document, or paste a bulleted list from anywhere into the map.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
@@ -31,6 +32,10 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Undo/redo**: up to 200 steps.
 - **Seven colour themes**: Dark, Light, Light grey, Dark grey, Dark blue, Light purple and
   Dark purple. Your choice is remembered between runs.
+- **Adjustable interface size** (toolbar or Ctrl +/-), also remembered between runs.
+- **Multi-line labels**: press Shift+Enter while editing to start a new line.
+- **Colours, notes and links**: give any branch its own colour, and attach notes or a web
+  link to a node (shown with a folded corner and on hover).
 - **Plain JSON files** that are easy to back up, diff or generate with other tools.
 - **Safe saving and crash recovery**: saves never leave a half-written file, and unsaved
   work is backed up in the background so it can be restored after a crash.
@@ -87,6 +92,8 @@ mind_mapper path/to/ideas.json
 | Move a node and its branch | Drag it |
 | Attach a branch to a different node | Drag it onto that node (the target is highlighted) and release |
 | Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
+| Colour, notes, rename or delete a node | Right-click it |
+| Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
 
@@ -97,6 +104,7 @@ mind_mapper path/to/ideas.json
 | Tab | Add a child to the selected node |
 | Enter | Add a sibling to the selected node |
 | F2 | Rename the selected node |
+| Ctrl + / Ctrl - / Ctrl 0 | Make the interface larger / smaller / reset it to 100% |
 | Delete | Delete the selected node and its branch |
 | Home | Fit the whole map in the window |
 | Ctrl+L | Tidy up: arrange the map without overlaps |
@@ -104,6 +112,7 @@ mind_mapper path/to/ideas.json
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
 | Ctrl+E | Export as PNG, SVG or Markdown (chosen by the file extension) |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
+| Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
 | Ctrl+C / Ctrl+X | Copy / cut the selected branch (or copy the whole map) as an indented outline |
 | Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
@@ -111,8 +120,8 @@ mind_mapper path/to/ideas.json
 | Ctrl+O | Open a map |
 | Ctrl+S / Ctrl+Shift+S | Save / save as |
 
-While renaming, Enter keeps the new label and Esc cancels. On the template gallery, Esc
-returns to the map you were editing.
+While renaming, Enter keeps the new label, Shift+Enter starts a new line and Esc cancels.
+On the template gallery, Esc returns to the map you were editing.
 
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
 work is discarded by opening another map, choosing a template or closing the window.
@@ -123,6 +132,10 @@ While a map has unsaved changes, a copy is written in the background at most eve
 seconds. If Mind Mapper closes unexpectedly, the next launch shows a banner on the start
 screen where you can **Restore** that work or **Discard** it. The copy is deleted when you
 save, or when you choose to discard your changes.
+
+Each open window keeps its own copy, so several windows can run side by side safely. Only
+work from windows that are no longer running is offered for restoring; if several crashed,
+their work is offered one after another.
 
 ## File format
 
@@ -140,8 +153,9 @@ parent by its position in the list:
 }
 ```
 
-A folded branch's node also has `"collapsed": true`. The field is omitted otherwise, so
-files from older versions load unchanged.
+Optional fields appear only when used, so files from older versions load unchanged:
+`"collapsed": true` on a folded node, `"color": "#rrggbb"` for a chosen colour, `"note"`
+for notes and `"link"` for a web address.
 
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
@@ -149,8 +163,9 @@ single tree, is rejected with an error message rather than partially loaded.
 Saving writes to a temporary file first and then swaps it into place, so a crash or full
 disk mid-save leaves the previous version intact.
 
-Settings (theme, recent files and window size) and the crash-recovery copy live in the
-app's data folder:
+Settings (`settings.json`: theme, interface size and recent files), the window size and the
+crash-recovery copies live in the app's data folder. Settings are shared safely between
+open windows: each change is merged into the file rather than overwriting it.
 
 | OS | Folder |
 |---|---|
@@ -199,6 +214,8 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/export.rs`](src/export.rs) | PNG, SVG and Markdown export |
 | [`src/search.rs`](src/search.rs) | The find bar and node matching |
 | [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
+| [`src/details.rs`](src/details.rs) | Side panel for colour, notes and link |
+| [`src/settings.rs`](src/settings.rs) | Settings file shared between windows |
 | [`src/icon.rs`](src/icon.rs) | The window icon, drawn from `assets/icon.svg` |
 | [`build.rs`](build.rs) | Embeds `assets/icon.ico` in the Windows executable |
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |

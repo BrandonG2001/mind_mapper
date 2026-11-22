@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// Key under which the chosen theme is kept in eframe's settings storage.
 const STORAGE_KEY: &str = "color_theme";
+/// Key under which the interface size (egui's zoom factor) is kept.
+const UI_ZOOM_KEY: &str = "ui_zoom";
+/// Interface sizes accepted when loading, matching the range egui's zoom keys allow.
+const UI_ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.2..=5.0;
 
 /// A selectable colour scheme for the whole window.
 ///
@@ -157,7 +161,8 @@ impl ColorTheme {
         visuals
     }
 
-    /// Read the theme saved by [`ColorTheme::save`].
+    /// Read the theme that versions before 0.5 kept in eframe's storage (used once, to
+    /// carry it over into the shared settings file).
     ///
     /// # Arguments
     ///
@@ -174,11 +179,6 @@ impl ColorTheme {
             .unwrap_or_default()
     }
 
-    /// Remember this theme in eframe's settings storage.
-    pub fn save(self, storage: &mut dyn Storage) {
-        eframe::set_value(storage, STORAGE_KEY, &self);
-    }
-
     /// Install this theme's style in `ctx` and switch egui to it.
     pub fn apply(self, ctx: &egui::Context) {
         let base = if self.is_dark() {
@@ -188,6 +188,71 @@ impl ColorTheme {
         };
         ctx.set_visuals_of(base, self.visuals());
         ctx.set_theme(base);
+    }
+}
+
+/// Read the interface size that versions before 0.5 kept in eframe's storage (used once,
+/// to carry it over into the shared settings file).
+///
+/// # Returns
+///
+/// The saved zoom factor (1.0 = 100%), or `None` if nothing valid was stored.
+#[must_use]
+pub fn load_ui_zoom(storage: Option<&dyn Storage>) -> Option<f32> {
+    storage
+        .and_then(|storage| eframe::get_value(storage, UI_ZOOM_KEY))
+        .filter(|zoom| UI_ZOOM_RANGE.contains(zoom))
+}
+
+/// "UI size  -  100%  +" buttons that scale the whole interface (also Ctrl +, Ctrl - and
+/// Ctrl 0, which egui handles itself).
+///
+/// Reads correctly in both left-to-right and right-to-left layouts.
+pub fn ui_size_control(ui: &mut Ui) {
+    let ctx = ui.ctx().clone();
+    let zoom_out_ctx = ctx.clone();
+    let zoom_in_ctx = ctx.clone();
+    let mut label = |ui: &mut Ui| {
+        ui.label("UI size");
+    };
+    let mut smaller = |ui: &mut Ui| {
+        if ui
+            .small_button("-")
+            .on_hover_text("Smaller (Ctrl -)")
+            .clicked()
+        {
+            egui::gui_zoom::zoom_out(&zoom_out_ctx);
+        }
+    };
+    let mut reset = |ui: &mut Ui| {
+        let percent = format!("{:.0}%", ctx.zoom_factor() * 100.0);
+        if ui
+            .small_button(percent)
+            .on_hover_text("Reset to 100% (Ctrl 0)")
+            .clicked()
+        {
+            ctx.set_zoom_factor(1.0);
+        }
+    };
+    let mut larger = |ui: &mut Ui| {
+        if ui
+            .small_button("+")
+            .on_hover_text("Larger (Ctrl +)")
+            .clicked()
+        {
+            egui::gui_zoom::zoom_in(&zoom_in_ctx);
+        }
+    };
+    // `&mut dyn FnMut` lets closures of different types share one array.
+    let mut parts: [&mut dyn FnMut(&mut Ui); 4] =
+        [&mut label, &mut smaller, &mut reset, &mut larger];
+    // A right-to-left layout places each new widget to the left of the previous one, so
+    // add them in reverse to keep the reading order.
+    if ui.layout().prefer_right_to_left() {
+        parts.reverse();
+    }
+    for part in parts {
+        part(ui);
     }
 }
 
@@ -217,10 +282,23 @@ mod tests {
         for theme in ColorTheme::ALL {
             let mut storage = MemoryStorage::default();
 
-            theme.save(&mut storage);
+            eframe::set_value(&mut storage, STORAGE_KEY, &theme);
 
             assert_eq!(ColorTheme::load(Some(&storage)), theme);
         }
+    }
+
+    #[test]
+    fn ui_zoom_round_trips_and_rejects_nonsense() {
+        let mut storage = MemoryStorage::default();
+        assert_eq!(load_ui_zoom(Some(&storage)), None);
+
+        eframe::set_value(&mut storage, UI_ZOOM_KEY, &1.5_f32);
+        assert_eq!(load_ui_zoom(Some(&storage)), Some(1.5));
+        eframe::set_value(&mut storage, UI_ZOOM_KEY, &50.0_f32);
+
+        assert_eq!(load_ui_zoom(Some(&storage)), None);
+        assert_eq!(load_ui_zoom(None), None);
     }
 
     #[test]

@@ -20,9 +20,12 @@ pub struct OutlineItem {
     pub parent: Option<usize>,
     /// The line's text, without bullet markers.
     pub text: String,
+    /// The address of a Markdown link (`[text](address)`) the line consisted of.
+    pub link: Option<String>,
 }
 
 /// `branch` and its descendants as a bullet outline, e.g. `"- Goals\n  - Ship it\n"`.
+/// Nodes with a web link become Markdown links, `- [Goals](https://...)`.
 #[must_use]
 pub fn branch_outline(map: &MindMap, branch: NodeId) -> String {
     let mut depth = vec![0_usize; map.slot_count()];
@@ -36,7 +39,17 @@ pub fn branch_outline(map: &MindMap, branch: NodeId) -> String {
         out.push_str(&" ".repeat(level * INDENT));
         out.push_str("- ");
         // A line break inside a label would end the bullet early.
-        out.push_str(&visit.node.text().replace(['\r', '\n'], " "));
+        let text = visit.node.text().replace(['\r', '\n'], " ");
+        match visit.node.link() {
+            Some(link) => {
+                out.push('[');
+                out.push_str(&text);
+                out.push_str("](");
+                out.push_str(link);
+                out.push(')');
+            }
+            None => out.push_str(&text),
+        }
         out.push('\n');
     }
     out
@@ -74,13 +87,28 @@ pub fn parse_outline(text: &str) -> Vec<OutlineItem> {
         {
             open.pop();
         }
+        let (text, link) = split_link(label);
         items.push(OutlineItem {
             parent: open.last().map(|&(_, index)| index),
-            text: label.to_owned(),
+            text: text.to_owned(),
+            link: link.map(str::to_owned),
         });
         open.push((indent, items.len() - 1));
     }
     items
+}
+
+/// Split a Markdown link line, `[text](address)`, into its text and address. Anything
+/// else is returned unchanged with no address.
+fn split_link(label: &str) -> (&str, Option<&str>) {
+    label
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|inner| inner.split_once("]("))
+        .filter(|(text, address)| !text.is_empty() && !address.trim().is_empty())
+        .map_or((label, None), |(text, address)| {
+            (text, Some(address.trim()))
+        })
 }
 
 /// The level (1-6) and text of a Markdown heading line.
@@ -147,6 +175,9 @@ pub fn paste(
     for item in items {
         let parent = item.parent.map_or(target, |parent| ids[parent]);
         let id = map.add_child(parent, &item.text)?;
+        if item.link.is_some() {
+            map.set_link(id, item.link.as_deref())?;
+        }
         if item.parent.is_none() {
             branches.push(id);
         }
@@ -204,6 +235,29 @@ mod tests {
     }
 
     #[test]
+    fn links_survive_copy_and_paste() {
+        let mut map = MindMap::new("root");
+        let docs = map.add_child(map.root(), "Docs").expect("root");
+        map.set_link(docs, Some("https://example.com/a(b)"))
+            .expect("docs");
+        let outline = branch_outline(&map, docs);
+        assert_eq!(outline, "- [Docs](https://example.com/a(b))\n");
+
+        let items = parse_outline(&outline);
+        assert_eq!(items[0].text, "Docs");
+        assert_eq!(items[0].link.as_deref(), Some("https://example.com/a(b)"));
+        let root = map.root();
+        let pasted = paste(&mut map, root, &items).expect("valid");
+
+        assert_eq!(
+            map.node(pasted[0]).expect("copy").link(),
+            Some("https://example.com/a(b)")
+        );
+        assert_eq!(split_link("[not a link"), ("[not a link", None));
+        assert_eq!(split_link("[](x)"), ("[](x)", None));
+    }
+
+    #[test]
     fn plain_lines_and_blank_input() {
         assert_eq!(parse_outline("  \n\n"), Vec::new());
         let items = parse_outline("alpha\n  beta\ngamma");
@@ -254,6 +308,7 @@ mod tests {
         let items = [OutlineItem {
             parent: Some(0),
             text: "self-parent".to_owned(),
+            link: None,
         }];
 
         let root = map.root();

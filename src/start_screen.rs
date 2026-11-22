@@ -10,7 +10,7 @@ use eframe::egui::{
 use crate::map_view::MapView;
 use crate::model::MindMap;
 use crate::templates::{TEMPLATES, Template};
-use crate::theme::{ColorTheme, theme_picker};
+use crate::theme::{ColorTheme, theme_picker, ui_size_control};
 
 /// Size of one template card.
 const CARD_SIZE: Vec2 = Vec2::new(240.0, 210.0);
@@ -109,6 +109,9 @@ impl StartScreen {
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     theme_picker(ui, theme);
                     ui.label("Theme");
+                    // Plain spacing: a separator here would stretch to the full height.
+                    ui.add_space(GAP);
+                    ui_size_control(ui);
                 });
                 ui.vertical_centered(|ui| {
                     ui.heading(RichText::new("Mind Mapper").size(30.0).strong());

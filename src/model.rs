@@ -54,6 +54,77 @@ pub struct Node {
     children: Vec<NodeId>,
     /// When true, the node's descendants are hidden.
     collapsed: bool,
+    /// Colour chosen for this node (and, unless they choose their own, its descendants).
+    color: Option<NodeColor>,
+    /// Free-form notes; empty when there are none.
+    note: String,
+    /// A web address attached to the node.
+    link: Option<String>,
+}
+
+impl Node {
+    /// A node with only a label, position and parent; every optional detail empty.
+    fn new(text: String, position: Point, parent: Option<NodeId>) -> Self {
+        Self {
+            text,
+            position,
+            parent,
+            children: Vec::new(),
+            collapsed: false,
+            color: None,
+            note: String::new(),
+            link: None,
+        }
+    }
+}
+
+/// An RGB colour chosen for a node, stored in files as `"#rrggbb"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// serde converts through `String`, using the `TryFrom`/`From` impls below.
+#[serde(try_from = "String", into = "String")]
+pub struct NodeColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl NodeColor {
+    /// A colour from its red, green and blue components.
+    #[must_use]
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// The red, green and blue components.
+    #[must_use]
+    pub const fn components(self) -> [u8; 3] {
+        [self.r, self.g, self.b]
+    }
+}
+
+impl TryFrom<String> for NodeColor {
+    type Error = String;
+
+    /// Parse `"#rrggbb"` (case-insensitive).
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        let invalid = || format!("invalid colour {text:?}; expected \"#rrggbb\"");
+        let hex = text
+            .strip_prefix('#')
+            .filter(|hex| hex.len() == 6)
+            .ok_or_else(invalid)?;
+        let channel = |at: usize| {
+            hex.get(at..at + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(invalid)
+        };
+        Ok(Self::rgb(channel(0)?, channel(2)?, channel(4)?))
+    }
+}
+
+impl From<NodeColor> for String {
+    fn from(color: NodeColor) -> Self {
+        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    }
 }
 
 impl Node {
@@ -85,6 +156,24 @@ impl Node {
     #[must_use]
     pub const fn is_collapsed(&self) -> bool {
         self.collapsed
+    }
+
+    /// The colour chosen for this node itself, if any (see [`MindMap::set_color`]).
+    #[must_use]
+    pub const fn color(&self) -> Option<NodeColor> {
+        self.color
+    }
+
+    /// The node's notes; empty when there are none.
+    #[must_use]
+    pub fn note(&self) -> &str {
+        &self.note
+    }
+
+    /// The web address attached to the node, if any.
+    #[must_use]
+    pub fn link(&self) -> Option<&str> {
+        self.link.as_deref()
     }
 }
 
@@ -121,7 +210,7 @@ pub enum MapError {
 /// A whole map is a list of records in pre-order (every parent comes before its children),
 /// and `parent` is the index of the parent record. That ordering rule makes cycles
 /// impossible, so a file can be validated in one pass.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct NodeRecord {
     /// Index of the parent record, or `None` for the root.
     pub parent: Option<usize>,
@@ -133,6 +222,16 @@ pub struct NodeRecord {
     /// treated as false when absent, so files from older versions still load.
     #[serde(default, skip_serializing_if = "is_false")]
     pub collapsed: bool,
+    /// The node's own colour, if any. Optional like the fields below, so files from
+    /// older versions still load and older versions ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<NodeColor>,
+    /// Notes; omitted when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// Attached web address, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// `serde` helper: skip writing a `false` flag.
@@ -170,13 +269,7 @@ impl MindMap {
     /// * `root_text` - Label of the central idea
     #[must_use]
     pub fn new(root_text: &str) -> Self {
-        let root = Node {
-            text: root_text.to_owned(),
-            position: Point::default(),
-            parent: None,
-            children: Vec::new(),
-            collapsed: false,
-        };
+        let root = Node::new(root_text.to_owned(), Point::default(), None);
         Self {
             slots: vec![Some(root)],
             free: Vec::new(),
@@ -326,13 +419,7 @@ impl MindMap {
     ) -> Result<NodeId, MapError> {
         // Validate before touching the slab so a failure leaves the map unchanged.
         self.node(parent).ok_or(MapError::NodeNotFound(parent))?;
-        let node = Node {
-            text: text.to_owned(),
-            position,
-            parent: Some(parent),
-            children: Vec::new(),
-            collapsed: false,
-        };
+        let node = Node::new(text.to_owned(), position, Some(parent));
         let id = if let Some(index) = self.free.pop() {
             self.slots[index] = Some(node);
             NodeId(index)
@@ -429,6 +516,42 @@ impl MindMap {
             return Err(MapError::RootNode);
         }
         self.node_mut(id)?.collapsed = collapsed;
+        Ok(())
+    }
+
+    /// Give a node its own colour (also used by its descendants that have none), or
+    /// `None` to go back to the automatic branch colour.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_color(&mut self, id: NodeId, color: Option<NodeColor>) -> Result<(), MapError> {
+        self.node_mut(id)?.color = color;
+        Ok(())
+    }
+
+    /// Replace a node's notes (trailing whitespace is trimmed; empty removes them).
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_note(&mut self, id: NodeId, note: &str) -> Result<(), MapError> {
+        let target = self.node_mut(id)?;
+        target.note.clear();
+        target.note.push_str(note.trim_end());
+        Ok(())
+    }
+
+    /// Attach a web address to a node, or remove it with `None` or a blank string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_link(&mut self, id: NodeId, link: Option<&str>) -> Result<(), MapError> {
+        self.node_mut(id)?.link = link
+            .map(str::trim)
+            .filter(|link| !link.is_empty())
+            .map(str::to_owned);
         Ok(())
     }
 
@@ -572,6 +695,9 @@ impl MindMap {
                 text: visit.node.text.clone(),
                 position: visit.node.position,
                 collapsed: visit.node.collapsed,
+                color: visit.node.color,
+                note: visit.node.note.clone(),
+                link: visit.node.link.clone(),
             });
         }
         records
@@ -605,11 +731,12 @@ impl MindMap {
                 }
             };
             slots.push(Some(Node {
-                text: record.text,
-                position: record.position,
-                parent,
-                children: Vec::new(),
                 collapsed: record.collapsed,
+                color: record.color,
+                note: record.note,
+                // An empty address is the same as none.
+                link: record.link.filter(|link| !link.trim().is_empty()),
+                ..Node::new(record.text, record.position, parent)
             }));
         }
         Ok(Self {
@@ -907,6 +1034,41 @@ mod tests {
     }
 
     #[test]
+    fn colour_note_and_link_survive_records() {
+        let (mut map, a, _, _) = sample_map();
+        map.set_color(a, Some(NodeColor::rgb(0x12, 0xab, 0xff)))
+            .expect("a exists");
+        map.set_note(a, "Remember this\nsecond line  \n")
+            .expect("a exists");
+        map.set_link(a, Some("  https://example.com  "))
+            .expect("a exists");
+
+        let rebuilt = MindMap::from_records(map.to_records()).expect("valid");
+        let node = rebuilt
+            .iter()
+            .find(|(_, node)| node.text() == "a")
+            .expect("a exists")
+            .1;
+
+        assert_eq!(node.color(), Some(NodeColor::rgb(0x12, 0xab, 0xff)));
+        assert_eq!(node.note(), "Remember this\nsecond line");
+        assert_eq!(node.link(), Some("https://example.com"));
+        map.set_link(a, Some("   ")).expect("a exists");
+        assert_eq!(map.node(a).expect("a").link(), None);
+    }
+
+    #[test]
+    fn node_colour_reads_and_writes_hex() {
+        let color = NodeColor::try_from("#0aFF10".to_owned()).expect("valid");
+
+        assert_eq!(color.components(), [0x0a, 0xff, 0x10]);
+        assert_eq!(String::from(color), "#0aff10");
+        for bad in ["0aff10", "#0aff1", "#0aff1g", "#0aff100"] {
+            assert!(NodeColor::try_from(bad.to_owned()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn set_position_moves_only_that_node() {
         let (mut map, a, _, a1) = sample_map();
         let child_before = map.node(a1).expect("a1").position();
@@ -940,9 +1102,7 @@ mod tests {
     fn from_records_rejects_invalid_input() {
         let record = |parent| NodeRecord {
             parent,
-            text: String::new(),
-            position: Point::default(),
-            collapsed: false,
+            ..NodeRecord::default()
         };
 
         assert_eq!(MindMap::from_records(Vec::new()), Err(MapError::Empty));

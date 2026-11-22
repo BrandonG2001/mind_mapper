@@ -12,7 +12,7 @@ use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
 use crate::clipboard;
-use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT, branch_accent, estimated_rect, wrap_label};
+use crate::map_view::{Accents, BASE_FONT_SIZE, LINE_HEIGHT, estimated_rect, wrap_label};
 use crate::model::MindMap;
 use crate::storage::{StorageError, write_atomically};
 
@@ -158,8 +158,15 @@ fn write_svg(out: &mut String, map: &MindMap, style: ExportStyle) -> fmt::Result
         r#"<rect width="100%" height="100%" fill="{}"/>"#,
         hex(style.background)
     )?;
-    // Edges first, so node boxes cover their ends.
-    for visit in map.visible_preorder() {
+    // Resolve every node's colour up front: edges are drawn first (so node boxes cover
+    // their ends), and both passes need the colours.
+    let mut accents = Accents::default();
+    accents.reset(map);
+    let colors: Vec<Color32> = map
+        .visible_preorder()
+        .map(|visit| accents.resolve(map, &visit, style.text))
+        .collect();
+    for (visit, &accent) in map.visible_preorder().zip(&colors) {
         let Some(parent) = visit.node.parent().and_then(|id| map.node(id)) else {
             continue;
         };
@@ -171,10 +178,10 @@ fn write_svg(out: &mut String, map: &MindMap, style: ExportStyle) -> fmt::Result
             r#"<path d="M {x1:.1} {y1:.1} C {:.1} {y1:.1}, {:.1} {y2:.1}, {x2:.1} {y2:.1}" fill="none" stroke="{}" stroke-width="{STROKE_WIDTH}"/>"#,
             x1 + bend,
             x2 - bend,
-            hex(branch_accent(visit.branch, style.text)),
+            hex(accent),
         )?;
     }
-    for visit in map.visible_preorder() {
+    for (visit, &accent) in map.visible_preorder().zip(&colors) {
         let rect = estimated_rect(visit.node);
         let (x, y) = at(rect.min.x, rect.min.y);
         writeln!(
@@ -183,7 +190,7 @@ fn write_svg(out: &mut String, map: &MindMap, style: ExportStyle) -> fmt::Result
             rect.width(),
             rect.height(),
             hex(style.node_fill),
-            hex(branch_accent(visit.branch, style.text)),
+            hex(accent),
         )?;
         let (center_x, center_y) = at(rect.center().x, rect.center().y);
         let line_count =

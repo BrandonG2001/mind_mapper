@@ -7,7 +7,7 @@ use crate::model::{MindMap, NodeId};
 /// Width of the find bar's text field.
 const FIELD_WIDTH: f32 = 240.0;
 
-/// Every node whose label contains `query`, ignoring case, in tree order.
+/// Every node whose label or notes contain `query`, ignoring case, in tree order.
 /// An empty (or blank) query matches nothing.
 #[must_use]
 pub fn find_matches(map: &MindMap, query: &str) -> Vec<NodeId> {
@@ -16,7 +16,10 @@ pub fn find_matches(map: &MindMap, query: &str) -> Vec<NodeId> {
         return Vec::new();
     }
     map.preorder()
-        .filter(|visit| visit.node.text().to_lowercase().contains(&query))
+        .filter(|visit| {
+            visit.node.text().to_lowercase().contains(&query)
+                || visit.node.note().to_lowercase().contains(&query)
+        })
         .map(|visit| visit.id)
         .collect()
 }
@@ -46,7 +49,6 @@ pub struct Search {
     /// The query and map revision `matches` was computed for; `None` = never computed.
     computed_for: Option<(String, u64)>,
     focus_requested: bool,
-    has_focus: bool,
 }
 
 impl Search {
@@ -62,12 +64,6 @@ impl Search {
     /// Put the keyboard focus back in the text field (e.g. Ctrl+F while already open).
     pub fn request_focus(&mut self) {
         self.focus_requested = true;
-    }
-
-    /// Whether the text field has keyboard focus, so other shortcuts should be ignored.
-    #[must_use]
-    pub const fn has_focus(&self) -> bool {
-        self.has_focus
     }
 
     /// Replace the query, as if typed (tests drive the find bar without a window).
@@ -173,7 +169,6 @@ impl Search {
                     field.request_focus();
                 }
             }
-            self.has_focus = field.has_focus();
 
             let summary = match (self.current, self.matches.len()) {
                 (_, 0) if self.query.trim().is_empty() => String::new(),
@@ -220,6 +215,9 @@ mod tests {
         assert_eq!(find_matches(&map, "OTH"), vec![other]);
         assert_eq!(find_matches(&map, "   "), Vec::new());
         assert_eq!(find_matches(&map, "missing"), Vec::new());
+        let mut map = map;
+        map.set_note(other, "mentions the PLAN too").expect("other");
+        assert_eq!(find_matches(&map, "plan").len(), 3);
     }
 
     #[test]

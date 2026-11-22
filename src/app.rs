@@ -10,18 +10,20 @@ use eframe::egui::{
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
 use crate::clipboard;
+use crate::details::{self, DetailsEdit, DetailsPanel, color_palette};
 use crate::export::{self, ExportStyle};
 use crate::history::History;
 use crate::layout;
-use crate::map_view::{BASE_FONT_SIZE, MapView};
+use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
 use crate::navigation::{self, Direction};
 use crate::recent::RecentFiles;
 use crate::recovery::{Recovered, RecoveryStore};
 use crate::search::{Search, SearchCommand};
+use crate::settings::{Settings, SettingsFile};
 use crate::start_screen::{StartChoice, StartContext, StartScreen};
 use crate::storage;
-use crate::theme::{ColorTheme, theme_picker};
+use crate::theme::{self, ColorTheme, theme_picker, ui_size_control};
 
 /// Application name: window title, and the folder name for settings and recovery data.
 pub const APP_NAME: &str = "Mind Mapper";
@@ -29,6 +31,8 @@ pub const APP_NAME: &str = "Mind Mapper";
 const AUTOSAVE_SECONDS: f64 = 20.0;
 /// Narrowest text box shown while editing, at 100% zoom.
 const MIN_EDITOR_WIDTH: f32 = 140.0;
+/// Space above and below the text inside the label editor, at 100% zoom.
+const EDITOR_PADDING: f32 = 8.0;
 /// Number of undo steps kept.
 const HISTORY_LIMIT: usize = 200;
 /// How strongly one scroll-wheel pixel changes the zoom.
@@ -61,6 +65,7 @@ enum Action {
     FindNext,
     FindPrevious,
     CloseFind,
+    ToggleDetails,
 }
 
 /// A clipboard request, which egui reports as an event rather than a key press.
@@ -73,7 +78,7 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 23] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 24] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S),
         Action::SaveAs,
@@ -137,6 +142,10 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 23] = [
     (
         KeyboardShortcut::new(Modifiers::NONE, Key::F3),
         Action::FindNext,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::I),
+        Action::ToggleDetails,
     ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::F),
@@ -232,8 +241,16 @@ pub struct MindMapApp {
     last_autosave: f64,
     /// Recently opened or saved files, shown on the start screen.
     recent: RecentFiles,
+    /// Where settings are saved; `None` if there is no data folder (nothing is saved).
+    settings_file: Option<SettingsFile>,
+    /// Interface size (egui's zoom factor), remembered between runs.
+    ui_zoom: f32,
     /// The open find bar, if any.
     search: Option<Search>,
+    /// The open notes/link/colour side panel, if any.
+    details: Option<DetailsPanel>,
+    /// The node the right-click menu was opened on.
+    context_node: Option<NodeId>,
     /// Increases with every edit, so cached results (search matches) know to refresh.
     revision: u64,
 }
@@ -254,13 +271,36 @@ impl MindMapApp {
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<&Path>) -> Self {
         let mut app = Self::with_map(MindMap::new(DEFAULT_ROOT_TEXT));
-        app.theme = ColorTheme::load(cc.storage);
-        app.recent = RecentFiles::load(cc.storage);
-        app.recovery = eframe::storage_dir(APP_NAME).map(|dir| RecoveryStore::in_dir(&dir));
-        if let Some(store) = &app.recovery {
-            match store.load() {
-                Ok(found) => app.recovered = found,
-                Err(err) => app.status = format!("Could not read recovered work: {err}"),
+        let data_dir = eframe::storage_dir(APP_NAME);
+        app.settings_file = data_dir.as_deref().map(SettingsFile::in_dir);
+        let settings = match &app.settings_file {
+            Some(file) if file.exists() => file.load(),
+            // First run of a version with the shared settings file: carry over what
+            // older versions kept in eframe's own storage.
+            _ => {
+                let carried_over = Settings {
+                    theme: ColorTheme::load(cc.storage),
+                    ui_zoom: theme::load_ui_zoom(cc.storage).unwrap_or(1.0),
+                    recent: RecentFiles::load(cc.storage),
+                };
+                app.update_settings(|settings| *settings = carried_over.clone());
+                carried_over
+            }
+        };
+        app.theme = settings.theme;
+        app.ui_zoom = settings.ui_zoom;
+        app.recent = settings.recent;
+        // Set the option directly (not `set_zoom_factor`, which waits a frame) so the
+        // first frame already uses the saved size.
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_factor = app.ui_zoom);
+        if let Some(dir) = data_dir {
+            match RecoveryStore::for_this_window(&dir) {
+                Ok(store) => {
+                    app.recovery = Some(store);
+                    app.find_orphan();
+                }
+                Err(err) => app.status = format!("Crash recovery is unavailable: {err}"),
             }
         }
         if let Some(path) = initial_path {
@@ -297,8 +337,31 @@ impl MindMapApp {
             autosave_pending: false,
             last_autosave: 0.0,
             recent: RecentFiles::default(),
+            settings_file: None,
+            ui_zoom: 1.0,
             search: None,
+            details: None,
+            context_node: None,
             revision: 0,
+        }
+    }
+
+    /// Apply `change` to the shared settings file (on top of other windows' changes) and
+    /// adopt the merged recent-files list. Without a data folder, only memory changes.
+    fn update_settings(&mut self, change: impl FnOnce(&mut Settings)) {
+        let Some(file) = &self.settings_file else {
+            let mut settings = Settings {
+                theme: self.theme,
+                ui_zoom: self.ui_zoom,
+                recent: std::mem::take(&mut self.recent),
+            };
+            change(&mut settings);
+            self.recent = settings.recent;
+            return;
+        };
+        match file.update(change) {
+            Ok(latest) => self.recent = latest.recent,
+            Err(err) => self.status = format!("Could not save settings: {err}"),
         }
     }
 
@@ -314,9 +377,9 @@ impl MindMapApp {
         if !self.autosave_pending {
             return;
         }
-        let Some(store) = &self.recovery else {
+        if self.recovery.is_none() {
             return;
-        };
+        }
         let now = ctx.input(|input| input.time);
         let due = self.last_autosave + AUTOSAVE_SECONDS;
         if now < due {
@@ -324,11 +387,37 @@ impl MindMapApp {
             ctx.request_repaint_after(Duration::from_secs_f64(due - now));
             return;
         }
-        if let Err(err) = store.save(&self.map, self.file_path.as_deref()) {
+        self.save_recovery_copy();
+        self.last_autosave = now;
+    }
+
+    /// Write this window's recovery copy now.
+    fn save_recovery_copy(&mut self) {
+        if let Some(store) = &self.recovery
+            && let Err(err) = store.save(&self.map, self.file_path.as_deref())
+        {
             self.status = format!("Auto-save failed: {err}");
         }
-        self.last_autosave = now;
         self.autosave_pending = false;
+    }
+
+    /// Look for unsaved work left by a window that is no longer running.
+    fn find_orphan(&mut self) {
+        if let Some(store) = &self.recovery {
+            match store.find_orphan() {
+                Ok(found) => self.recovered = found,
+                Err(err) => self.status = format!("Could not read recovered work: {err}"),
+            }
+        }
+    }
+
+    /// Delete the files of the recovered work on offer (it was restored or discarded).
+    fn discard_orphan(&mut self) {
+        if let Some(recovered) = self.recovered.take()
+            && let Err(err) = recovered.discard()
+        {
+            self.status = format!("Could not remove recovered work: {err}");
+        }
     }
 
     /// Delete the recovery copy (after a save, or once the user discards their work).
@@ -360,11 +449,18 @@ impl MindMapApp {
     }
 
     fn perform(&mut self, action: Action) {
-        // Any toolbar or keyboard action first finishes an in-progress edit.
+        // Any toolbar or keyboard action first finishes in-progress edits.
         self.commit_edit();
+        self.flush_details();
         let root = self.map.root();
         match action {
-            Action::New => self.screen = Screen::Start { can_return: true },
+            Action::New => {
+                // Pick up files other windows opened since this one started.
+                if let Some(file) = &self.settings_file {
+                    self.recent = file.load().recent;
+                }
+                self.screen = Screen::Start { can_return: true };
+            }
             Action::Open => {
                 if self.confirm_discard()
                     && let Some(path) = file_dialog().pick_file()
@@ -447,6 +543,11 @@ impl MindMapApp {
             Action::FindNext => self.search_command(SearchCommand::Next),
             Action::FindPrevious => self.search_command(SearchCommand::Previous),
             Action::CloseFind => self.search = None,
+            Action::ToggleDetails => {
+                if self.details.take().is_none() {
+                    self.details = Some(DetailsPanel::default());
+                }
+            }
         }
     }
 
@@ -489,6 +590,10 @@ impl MindMapApp {
         let map = &self.map;
         self.selected = self.selected.filter(|&id| map.node(id).is_some());
         self.editing = None;
+        // Reload the side panel so it shows (and will not re-apply) the undone text.
+        if let Some(panel) = &mut self.details {
+            panel.follow(&self.map, panel.node());
+        }
         self.mark_dirty();
     }
 
@@ -498,6 +603,11 @@ impl MindMapApp {
         self.selected = None;
         self.editing = None;
         self.drag = None;
+        // Node ids of the old map mean nothing in the new one.
+        if let Some(panel) = &mut self.details {
+            *panel = DetailsPanel::default();
+        }
+        self.context_node = None;
         self.file_path = path;
         self.dirty = false;
         self.needs_fit = true;
@@ -517,12 +627,22 @@ impl MindMapApp {
             StartChoice::Open => self.perform(Action::Open),
             StartChoice::Back => self.screen = Screen::Editor,
             StartChoice::Restore => {
-                if let Some(Recovered { map, source }) = self.recovered.take() {
+                if let Some(recovered) = self.recovered.take() {
+                    let Recovered { map, source, files } = recovered;
                     self.deferred_open = None;
                     self.replace_map(map, source);
-                    // Still unsaved; this also keeps the recovery copy up to date.
+                    // Still unsaved: copy it into this window's recovery file before the
+                    // orphaned copy is deleted, so there is never a moment without one.
                     self.mark_dirty();
+                    self.save_recovery_copy();
                     "Restored unsaved work from the last session".clone_into(&mut self.status);
+                    if let Some(files) = files
+                        && let Err(err) = files.discard()
+                    {
+                        self.status = format!("Could not remove recovered work: {err}");
+                    }
+                    // Other crashed windows' work is offered on the start screen.
+                    self.find_orphan();
                 }
             }
             StartChoice::OpenRecent(index) => {
@@ -533,9 +653,12 @@ impl MindMapApp {
                 }
             }
             StartChoice::DiscardRecovery => {
-                self.recovered = None;
-                self.clear_recovery();
-                if let Some(path) = self.deferred_open.take() {
+                self.discard_orphan();
+                // Offer the next crashed window's work, if any, before opening a file.
+                self.find_orphan();
+                if self.recovered.is_none()
+                    && let Some(path) = self.deferred_open.take()
+                {
                     self.open_path(&path);
                 }
             }
@@ -546,13 +669,13 @@ impl MindMapApp {
         match storage::load_from_path(path) {
             Ok(map) => {
                 self.status = format!("Opened {}", file_label(path));
-                self.recent.add(path);
+                self.update_settings(|settings| settings.recent.add(path));
                 self.replace_map(map, Some(path.to_owned()));
             }
             Err(err) => {
                 self.status = format!("Could not open {}: {err}", path.display());
                 // Drop dead entries (moved or deleted files) from the recent list.
-                self.recent.remove(path);
+                self.update_settings(|settings| settings.recent.remove(path));
             }
         }
     }
@@ -561,7 +684,7 @@ impl MindMapApp {
         match storage::save_to_path(&self.map, &path) {
             Ok(()) => {
                 self.status = format!("Saved {}", file_label(&path));
-                self.recent.add(&path);
+                self.update_settings(|settings| settings.recent.add(&path));
                 self.dirty = false;
                 self.autosave_pending = false;
                 self.clear_recovery();
@@ -628,7 +751,7 @@ impl MindMapApp {
             .show()
             == MessageDialogResult::Yes;
         if discard {
-            self.recovered = None;
+            self.discard_orphan();
             self.clear_recovery();
             // If the current map stays open (e.g. the file dialog is cancelled), keep
             // protecting it.
@@ -651,7 +774,9 @@ impl MindMapApp {
         let Some(session) = self.editing.take() else {
             return;
         };
-        let text = session.buffer.trim();
+        // Windows clipboards and keyboards may produce "\r\n"; store plain "\n".
+        let buffer = session.buffer.replace("\r\n", "\n");
+        let text = buffer.trim();
         let unchanged = self
             .map
             .node(session.id)
@@ -705,6 +830,12 @@ impl MindMapApp {
             ),
             ("Find", Action::Find, true, "Ctrl+F"),
             (
+                "Notes",
+                Action::ToggleDetails,
+                true,
+                "Ctrl+I: colour, notes and link",
+            ),
+            (
                 "Tidy up",
                 Action::Tidy,
                 true,
@@ -727,11 +858,17 @@ impl MindMapApp {
                     clicked = Some(action);
                 }
             }
-            ui.separator();
+        });
+        // Second row: appearance settings, map zoom and the status message.
+        ui.horizontal(|ui| {
             ui.label("Theme");
             theme_picker(ui, &mut self.theme);
             ui.separator();
-            ui.label(format!("{:.0}%", self.view.camera().zoom() * 100.0));
+            ui_size_control(ui);
+            ui.separator();
+            ui.label(format!("Map {:.0}%", self.view.camera().zoom() * 100.0))
+                .on_hover_text("Map zoom: scroll wheel");
+            ui.separator();
             ui.label(&self.status);
         });
         clicked
@@ -868,12 +1005,27 @@ impl MindMapApp {
             self.commit_edit();
             return;
         };
+        // Enter saves the label; Shift+Enter falls through to the text box as a new line.
+        let editor_id = ui.make_persistent_id("node_label_editor");
+        if ui.memory(|memory| memory.has_focus(editor_id))
+            && ui.input_mut(|input| take_plain_enter(&mut input.events))
+        {
+            self.commit_edit();
+            return;
+        }
         let zoom = self.view.camera().zoom();
+        // Grow with the text: one row per line, plus one while a new line is started.
+        let rows =
+            session.buffer.lines().count().max(1) + usize::from(session.buffer.ends_with('\n'));
+        let rows = f32::from(u16::try_from(rows).unwrap_or(u16::MAX));
         let size = Vec2::new(
             node_rect.width().max(MIN_EDITOR_WIDTH * zoom),
-            node_rect.height(),
+            node_rect
+                .height()
+                .max((rows * LINE_HEIGHT + 2.0 * EDITOR_PADDING) * zoom),
         );
-        let editor = egui::TextEdit::singleline(&mut session.buffer)
+        let editor = egui::TextEdit::multiline(&mut session.buffer)
+            .id(editor_id)
             .font(FontId::proportional(BASE_FONT_SIZE * zoom))
             .hint_text(NEW_NODE_TEXT)
             .align(Align2::CENTER_CENTER);
@@ -920,7 +1072,119 @@ impl MindMapApp {
             self.view
                 .outline(&painter, target, ui.visuals().selection.stroke.color);
         }
+        if response.secondary_clicked() {
+            self.context_node = response
+                .interact_pointer_pos()
+                .and_then(|pos| self.view.hit_test(pos));
+            if self.context_node.is_some() {
+                self.selected = self.context_node;
+            }
+        }
+        if let Some(id) = self.context_node {
+            response.context_menu(|ui| self.node_menu(ui, id));
+        }
+        let hovered_details = response
+            .hover_pos()
+            .filter(|_| self.drag.is_none())
+            .and_then(|pos| self.view.hit_test(pos))
+            .and_then(|id| details::hover_text(&self.map, id));
+        if let Some(text) = hovered_details {
+            response.on_hover_text_at_pointer(text);
+        }
         self.show_editor(ui);
+    }
+
+    /// The right-click menu of node `id`: colour, notes, rename and delete.
+    fn node_menu(&mut self, ui: &mut Ui, id: NodeId) {
+        let Some(current) = self.map.node(id).map(Node::color) else {
+            return;
+        };
+        ui.label(egui::RichText::new("Colour").strong());
+        if let Some(color) = color_palette(ui, current) {
+            self.apply_details(id, &[DetailsEdit::Color(color)]);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Notes and link...").clicked() {
+            self.details.get_or_insert_with(DetailsPanel::default);
+            ui.close();
+        }
+        if ui.button("Rename").clicked() {
+            self.selected = Some(id);
+            self.perform(Action::Rename);
+            ui.close();
+        }
+        let deletable = id != self.map.root();
+        if ui
+            .add_enabled(deletable, egui::Button::new("Delete"))
+            .clicked()
+        {
+            self.selected = Some(id);
+            self.perform(Action::Delete);
+            ui.close();
+        }
+    }
+
+    /// Apply side-panel or menu edits to node `id`, as one undo step.
+    fn apply_details(&mut self, id: NodeId, edits: &[DetailsEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        self.edit_map(|map| {
+            edits.iter().try_for_each(|edit| match edit {
+                DetailsEdit::Note(note) => map.set_note(id, note),
+                DetailsEdit::Link(link) => map.set_link(id, link.as_deref()),
+                DetailsEdit::Color(color) => map.set_color(id, *color),
+            })
+        });
+        // Keep the side panel in step, so it never holds text the map no longer has.
+        if let Some(panel) = &mut self.details
+            && panel.node() == Some(id)
+        {
+            panel.follow(&self.map, Some(id));
+        }
+    }
+
+    /// Save any text typed in the details panel that has not been applied yet.
+    fn flush_details(&mut self) {
+        let pending = self
+            .details
+            .as_ref()
+            .and_then(|panel| Some((panel.node()?, panel.pending(&self.map))));
+        if let Some((id, edits)) = pending {
+            self.apply_details(id, &edits);
+        }
+    }
+
+    /// Show the details side panel for the selected node.
+    fn details_panel(&mut self, ui: &mut Ui) {
+        // Taken out so `self` can be used freely below; put back at the end.
+        let Some(mut panel) = self.details.take() else {
+            return;
+        };
+        if panel.node() != self.selected {
+            if let Some(id) = panel.node() {
+                self.apply_details(id, &panel.pending(&self.map));
+            }
+            panel.follow(&self.map, self.selected);
+        }
+        let outcome = egui::Panel::right("details")
+            .resizable(true)
+            .default_size(280.0)
+            .show(ui, |ui| panel.show(ui, &self.map))
+            .inner;
+        if let Some(id) = panel.node() {
+            if outcome.commit {
+                self.apply_details(id, &panel.pending(&self.map));
+            }
+            if let Some(color) = outcome.color {
+                self.apply_details(id, &[DetailsEdit::Color(color)]);
+            }
+        }
+        if let Some(address) = outcome.open_link {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(address));
+        }
+        self.details = Some(panel);
     }
 
     /// Act on a find-bar command: jump to the first, next or previous match, or close.
@@ -1016,6 +1280,11 @@ impl MindMapApp {
     /// Install the chosen theme in egui if it changed since the last frame.
     fn sync_theme(&mut self, ctx: &egui::Context) {
         if self.applied_theme != Some(self.theme) {
+            // `None` is the first frame, applying the saved theme: nothing new to save.
+            if self.applied_theme.is_some() {
+                let theme = self.theme;
+                self.update_settings(|settings| settings.theme = theme);
+            }
             self.theme.apply(ctx);
             self.applied_theme = Some(self.theme);
         }
@@ -1024,6 +1293,11 @@ impl MindMapApp {
     fn handle_window(&mut self, ui: &Ui) {
         let ctx = ui.ctx();
         self.sync_theme(ctx);
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.ui_zoom).abs() > f32::EPSILON {
+            self.ui_zoom = zoom;
+            self.update_settings(|settings| settings.ui_zoom = zoom);
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.confirm_discard() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
         }
@@ -1036,7 +1310,7 @@ impl MindMapApp {
 
     fn handle_shortcuts(&mut self, ui: &Ui) {
         // While a text field has focus, keys (and Ctrl+C/X/V) belong to it.
-        if self.editing.is_some() || self.search.as_ref().is_some_and(Search::has_focus) {
+        if self.editing.is_some() || ui.ctx().egui_wants_keyboard_input() {
             return;
         }
         let ctx = ui.ctx();
@@ -1079,6 +1353,22 @@ impl MindMapApp {
     }
 }
 
+/// Remove plain Enter presses (without Shift) from `events`.
+///
+/// # Returns
+///
+/// Whether any were removed.
+fn take_plain_enter(events: &mut Vec<Event>) -> bool {
+    let before = events.len();
+    events.retain(|event| {
+        !matches!(
+            event,
+            Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if !modifiers.shift
+        )
+    });
+    events.len() != before
+}
+
 /// Short name for status messages: the file name, so long paths don't widen the toolbar.
 fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
     path.file_name()
@@ -1092,12 +1382,6 @@ fn file_dialog() -> FileDialog {
 }
 
 impl eframe::App for MindMapApp {
-    /// Called by eframe on exit and periodically, to remember settings between runs.
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.theme.save(storage);
-        self.recent.save(storage);
-    }
-
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_window(ui);
         self.autosave(ui.ctx());
@@ -1132,6 +1416,7 @@ impl eframe::App for MindMapApp {
                 self.search_command(command);
             }
         }
+        self.details_panel(ui);
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
     }
 }
@@ -1178,6 +1463,38 @@ mod tests {
 
         assert_eq!(app.map.node(child).expect("child").text(), "Idea");
         assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn multi_line_labels_keep_inner_line_breaks() {
+        let (mut app, child) = app_with_child();
+        app.start_edit(child, " First line\r\nsecond line \n".to_owned());
+
+        app.commit_edit();
+
+        assert_eq!(
+            app.map.node(child).expect("child").text(),
+            "First line\nsecond line"
+        );
+    }
+
+    #[test]
+    fn only_plain_enter_is_taken() {
+        let key = |modifiers| Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut events = vec![key(Modifiers::SHIFT), Event::Text("x".to_owned())];
+        assert!(!take_plain_enter(&mut events));
+        assert_eq!(events.len(), 2);
+
+        events.push(key(Modifiers::NONE));
+        assert!(take_plain_enter(&mut events));
+
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
@@ -1411,6 +1728,50 @@ mod tests {
     }
 
     #[test]
+    fn details_edits_apply_as_one_undo_step_and_follow_undo() {
+        let (mut app, child) = app_with_child();
+        app.selected = Some(child);
+        let mut panel = DetailsPanel::default();
+        panel.follow(&app.map, Some(child));
+        app.details = Some(panel);
+        let red = details::PALETTE[3];
+
+        app.apply_details(
+            child,
+            &[
+                DetailsEdit::Note("first".to_owned()),
+                DetailsEdit::Link(Some("https://example.com".to_owned())),
+                DetailsEdit::Color(Some(red)),
+            ],
+        );
+        let node = app.map.node(child).expect("child");
+        assert_eq!(
+            (node.note(), node.link(), node.color()),
+            ("first", Some("https://example.com"), Some(red))
+        );
+        app.perform(Action::Undo);
+
+        let node = app.map.node(child).expect("child");
+        assert_eq!((node.note(), node.link(), node.color()), ("", None, None));
+        // The panel reloaded, so it has nothing stale to re-apply.
+        assert_eq!(
+            app.details.as_ref().expect("panel").pending(&app.map),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn toggling_details_opens_and_closes_the_panel() {
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+
+        app.perform(Action::ToggleDetails);
+        assert!(app.details.is_some());
+        app.perform(Action::ToggleDetails);
+
+        assert!(app.details.is_none());
+    }
+
+    #[test]
     fn root_cannot_be_deleted() {
         let mut app = MindMapApp::with_map(MindMap::new("root"));
         app.selected = Some(app.map.root());
@@ -1470,12 +1831,15 @@ mod tests {
 
     #[test]
     fn restore_opens_recovered_map_as_unsaved() {
+        let dir = TempDir::new("app_restore");
         let mut app = MindMapApp::with_map(MindMap::new("root"));
+        app.recovery = Some(RecoveryStore::for_this_window(dir.path()).expect("store"));
         let mut map = MindMap::new("recovered");
         map.add_child(map.root(), "idea").expect("root exists");
         app.recovered = Some(Recovered {
             map: map.clone(),
             source: Some(PathBuf::from("ideas.json")),
+            files: None,
         });
         app.deferred_open = Some(PathBuf::from("other.json"));
 
@@ -1485,31 +1849,44 @@ mod tests {
         assert_eq!(app.map, map);
         assert_eq!(app.file_path, Some(PathBuf::from("ideas.json")));
         assert!(app.dirty);
-        assert!(app.autosave_pending);
+        // Copied into this window's own recovery file straight away.
+        let copy = app
+            .recovery
+            .as_ref()
+            .expect("store")
+            .load()
+            .expect("readable");
+        assert_eq!(copy.expect("copy written").map, map);
         assert!(app.recovered.is_none());
         assert!(app.deferred_open.is_none());
     }
 
     #[test]
-    fn discard_recovery_deletes_copy_and_opens_deferred_file() {
+    fn discard_recovery_deletes_orphan_and_opens_deferred_file() {
         let dir = TempDir::new("app_discard");
-        let store = RecoveryStore::in_dir(dir.path());
-        let recovered = MindMap::new("recovered");
-        store.save(&recovered, None).expect("save succeeds");
+        // A window that crashed with unsaved work.
+        let crashed = RecoveryStore::for_this_window(dir.path()).expect("store");
+        crashed
+            .save(&MindMap::new("recovered"), None)
+            .expect("save succeeds");
+        crashed.simulate_crash();
         let deferred = dir.path().join("deferred.json");
         storage::save_to_path(&MindMap::new("deferred"), &deferred).expect("save succeeds");
         let mut app = MindMapApp::with_map(MindMap::new("root"));
-        app.recovery = Some(store.clone());
-        app.recovered = Some(Recovered {
-            map: recovered,
-            source: None,
-        });
+        app.recovery = Some(RecoveryStore::for_this_window(dir.path()).expect("store"));
+        app.find_orphan();
+        assert!(app.recovered.is_some());
         app.deferred_open = Some(deferred.clone());
 
         app.choose(StartChoice::DiscardRecovery);
 
-        assert_eq!(store.load().expect("load succeeds"), None);
         assert!(app.recovered.is_none());
+        let recovery_files = std::fs::read_dir(dir.path())
+            .expect("readable")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("recovery"))
+            .count();
+        assert_eq!(recovery_files, 0);
         assert_eq!(app.file_path, Some(deferred));
         assert_eq!(app.screen, Screen::Editor);
     }
@@ -1517,34 +1894,40 @@ mod tests {
     #[test]
     fn autosave_waits_for_interval_then_writes_recovery_copy() {
         let dir = TempDir::new("app_autosave");
-        let store = RecoveryStore::in_dir(dir.path());
         let ctx = egui::Context::default();
         let (mut app, _) = app_with_child();
-        app.recovery = Some(store.clone());
+        app.recovery = Some(RecoveryStore::for_this_window(dir.path()).expect("store"));
+        let saved_copy = |app: &MindMapApp| {
+            app.recovery
+                .as_ref()
+                .expect("store set")
+                .load()
+                .expect("load succeeds")
+        };
         // The app has just started (time 0), so the first interval has not elapsed.
         app.autosave(&ctx);
-        assert_eq!(store.load().expect("load succeeds"), None);
+        assert!(saved_copy(&app).is_none());
 
         app.last_autosave = -AUTOSAVE_SECONDS;
         app.autosave(&ctx);
 
-        let saved = store.load().expect("load succeeds").expect("copy written");
-        assert_eq!(saved.map, app.map);
+        assert_eq!(saved_copy(&app).expect("copy written").map, app.map);
         assert!(!app.autosave_pending);
     }
 
     #[test]
     fn saving_removes_recovery_copy() {
         let dir = TempDir::new("app_save_clears");
-        let store = RecoveryStore::in_dir(dir.path());
         let (mut app, _) = app_with_child();
-        app.recovery = Some(store.clone());
+        let store = RecoveryStore::for_this_window(dir.path()).expect("store");
         store.save(&app.map, None).expect("save succeeds");
+        app.recovery = Some(store);
 
         app.save_to(dir.path().join("map.json"));
 
         assert!(!app.dirty);
-        assert_eq!(store.load().expect("load succeeds"), None);
+        let store = app.recovery.as_ref().expect("store set");
+        assert!(store.load().expect("load succeeds").is_none());
     }
 
     #[test]
@@ -1566,6 +1949,28 @@ mod tests {
         let path = Path::new("some").join("folder").join("ideas.json");
 
         assert_eq!(file_label(&path), "ideas.json");
+    }
+
+    #[test]
+    fn settings_changes_are_saved_to_the_shared_file() {
+        let dir = TempDir::new("app_settings");
+        let ctx = egui::Context::default();
+        let mut app = MindMapApp::with_map(MindMap::new("root"));
+        app.settings_file = Some(SettingsFile::in_dir(dir.path()));
+        // Another window adds a recent file meanwhile.
+        SettingsFile::in_dir(dir.path())
+            .update(|settings| settings.recent.add(Path::new("other.json")))
+            .expect("update succeeds");
+
+        app.sync_theme(&ctx);
+        app.theme = ColorTheme::LightGrey;
+        app.sync_theme(&ctx);
+        app.save_to(dir.path().join("mine.json"));
+
+        let saved = SettingsFile::in_dir(dir.path()).load();
+        assert_eq!(saved.theme, ColorTheme::LightGrey);
+        assert_eq!(saved.recent.paths().len(), 2, "both windows' files kept");
+        assert_eq!(app.recent, saved.recent);
     }
 
     #[test]
