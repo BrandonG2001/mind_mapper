@@ -57,3 +57,16 @@ jobs:
         run: cargo build --release --locked --target aarch64-unknown-linux-gnu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+  licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      # Fails if a dependency uses a license not accepted in about.toml.
+      - name: Generate notices
+        run: cargo about generate --locked about.hbs -o THIRD_PARTY_NOTICES.txt

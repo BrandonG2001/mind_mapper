@@ -9,10 +9,12 @@ use eframe::egui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
+use crate::export::{self, ExportStyle};
 use crate::history::History;
 use crate::layout;
 use crate::map_view::{BASE_FONT_SIZE, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
+use crate::navigation::{self, Direction};
 use crate::recent::RecentFiles;
 use crate::recovery::{Recovered, RecoveryStore};
 use crate::start_screen::{StartChoice, StartContext, StartScreen};
@@ -51,11 +53,13 @@ enum Action {
     CenterView,
     Tidy,
     ToggleCollapse,
+    Navigate(Direction),
+    Export,
 }
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 14] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 19] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S),
         Action::SaveAs,
@@ -112,6 +116,26 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 14] = [
         KeyboardShortcut::new(Modifiers::NONE, Key::Space),
         Action::ToggleCollapse,
     ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::E),
+        Action::Export,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::ArrowUp),
+        Action::Navigate(Direction::Up),
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::ArrowDown),
+        Action::Navigate(Direction::Down),
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::ArrowLeft),
+        Action::Navigate(Direction::Left),
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::ArrowRight),
+        Action::Navigate(Direction::Right),
+    ),
 ];
 
 /// Which page the window is showing.
@@ -162,6 +186,8 @@ pub struct MindMapApp {
     applied_theme: Option<ColorTheme>,
     /// The whole map is fitted into view once the canvas size is known.
     needs_fit: bool,
+    /// A node to scroll into view on the next frame (after keyboard navigation).
+    reveal: Option<NodeId>,
     window_title: String,
     status: String,
     /// Where unsaved work is copied for crash recovery; `None` if there is no data folder.
@@ -228,6 +254,7 @@ impl MindMapApp {
             theme: ColorTheme::default(),
             applied_theme: None,
             needs_fit: true,
+            reveal: None,
             window_title: String::new(),
             status: String::new(),
             recovery: None,
@@ -374,6 +401,8 @@ impl MindMapApp {
                     self.toggle_collapse(id);
                 }
             }
+            Action::Export => self.export_dialog(),
+            Action::Navigate(direction) => self.navigate(direction),
         }
     }
 
@@ -498,6 +527,45 @@ impl MindMapApp {
         self.file_path = Some(path);
     }
 
+    /// Ask where to export, then export there.
+    fn export_dialog(&mut self) {
+        let stem = self
+            .file_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map_or_else(|| "mind_map".into(), |stem| stem.to_string_lossy());
+        let dialog = FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .add_filter("SVG drawing", &["svg"])
+            .add_filter("Markdown outline", &["md"])
+            .set_file_name(format!("{stem}.png"));
+        if let Some(path) = dialog.save_file() {
+            self.export_to(&path);
+        }
+    }
+
+    /// Move the selection with an arrow key and scroll the new node into view. With
+    /// nothing selected, any arrow starts at the central idea.
+    fn navigate(&mut self, direction: Direction) {
+        let target = match self.selected {
+            Some(from) => navigation::neighbor(&self.map, from, direction),
+            None => Some(self.map.root()),
+        };
+        if target.is_some() {
+            self.selected = target;
+            self.reveal = target;
+        }
+    }
+
+    /// Export the map to `path` (format from its extension) in the current theme's colours.
+    fn export_to(&mut self, path: &Path) {
+        let style = ExportStyle::from_visuals(&self.theme.visuals());
+        self.status = match export::export(&self.map, style, path) {
+            Ok(()) => format!("Exported {}", file_label(path)),
+            Err(err) => format!("Could not export {}: {err}", file_label(path)),
+        };
+    }
+
     /// Ask before throwing away unsaved (or recovered) work. If the user agrees, the
     /// recovery copy is deleted too.
     ///
@@ -585,6 +653,12 @@ impl MindMapApp {
             ),
             ("Delete", Action::Delete, can_delete, "Delete"),
             ("Center", Action::CenterView, true, "Home"),
+            (
+                "Export",
+                Action::Export,
+                true,
+                "Ctrl+E: PNG, SVG or Markdown",
+            ),
             (
                 "Tidy up",
                 Action::Tidy,
@@ -778,6 +852,9 @@ impl MindMapApp {
             self.view.fit(&self.map, response.rect);
             self.needs_fit = false;
         }
+        if let Some(id) = self.reveal.take() {
+            self.scroll_into_view(id, response.rect);
+        }
         painter.rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
         self.handle_zoom(ui, &response);
         self.handle_pointer(ui, &response);
@@ -792,6 +869,21 @@ impl MindMapApp {
                 .outline(&painter, target, ui.visuals().selection.stroke.color);
         }
         self.show_editor(ui);
+    }
+
+    /// Pan (without zooming) so `id` is comfortably inside `canvas`, if it isn't already.
+    fn scroll_into_view(&mut self, id: NodeId, canvas: Rect) {
+        let Some(position) = self.map.node(id).map(Node::position) else {
+            return;
+        };
+        let on_screen = self.view.camera().world_to_screen(position);
+        // Keep a margin so the whole node box, not just its centre, stays visible.
+        let comfortable = canvas.shrink2(canvas.size() * 0.15);
+        if !comfortable.contains(on_screen) {
+            self.view
+                .camera_mut()
+                .look_at(position, comfortable.clamp(on_screen));
+        }
     }
 
     /// Install the chosen theme in egui if it changed since the last frame.
@@ -1066,6 +1158,51 @@ mod tests {
 
         assert!(!app.map.node(target).expect("target").is_collapsed());
         assert_eq!(app.map.node(child).expect("child").parent(), Some(target));
+    }
+
+    #[test]
+    fn arrows_start_at_root_then_follow_the_map() {
+        let (mut app, child) = app_with_child();
+        app.selected = None;
+
+        app.perform(Action::Navigate(Direction::Down));
+        assert_eq!(app.selected, Some(app.map.root()));
+        app.perform(Action::Navigate(Direction::Right));
+        assert_eq!(app.selected, Some(child));
+        assert_eq!(app.reveal, Some(child));
+        // Nothing further out: the selection stays put.
+        app.perform(Action::Navigate(Direction::Right));
+
+        assert_eq!(app.selected, Some(child));
+    }
+
+    #[test]
+    fn scroll_into_view_pans_only_when_needed() {
+        let (mut app, child) = app_with_child();
+        let canvas = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let position = app.map.node(child).expect("child").position();
+        app.view.camera_mut().look_at(position, canvas.center());
+        let centred = *app.view.camera();
+
+        app.scroll_into_view(child, canvas);
+        assert_eq!(*app.view.camera(), centred);
+        app.view.camera_mut().pan(Vec2::new(5000.0, 0.0));
+        app.scroll_into_view(child, canvas);
+
+        let on_screen = app.view.camera().world_to_screen(position);
+        assert!(canvas.contains(on_screen));
+    }
+
+    #[test]
+    fn export_reports_success_and_bad_extensions() {
+        let dir = TempDir::new("app_export");
+        let (mut app, _) = app_with_child();
+
+        app.export_to(&dir.path().join("map.md"));
+        assert_eq!(app.status, "Exported map.md");
+        app.export_to(&dir.path().join("map.txt"));
+
+        assert!(app.status.starts_with("Could not export map.txt"));
     }
 
     #[test]

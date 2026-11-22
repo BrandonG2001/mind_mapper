@@ -102,9 +102,7 @@ impl MapView {
         self.layout.clear();
         let handle_radius = HANDLE_RADIUS * zoom;
         for visit in map.visible_preorder() {
-            let accent = visit.branch.map_or(text_color, |branch| {
-                BRANCH_COLORS[branch % BRANCH_COLORS.len()]
-            });
+            let accent = branch_accent(visit.branch, text_color);
             let center = self.camera.world_to_screen(visit.node.position());
             // Which way the branch grows: away from the parent (the root has no handle).
             let mut outward = None;
@@ -266,15 +264,57 @@ fn paint_handle(
     }
 }
 
+/// Colour of a branch's edges and borders: `root_color` for the root itself, otherwise
+/// one of the branch colours, cycling by the index of the root's child it descends from.
+pub(crate) fn branch_accent(branch: Option<usize>, root_color: Color32) -> Color32 {
+    branch.map_or(root_color, |branch| {
+        BRANCH_COLORS[branch % BRANCH_COLORS.len()]
+    })
+}
+
+/// Height of one line of label text at 100% zoom.
+pub(crate) const LINE_HEIGHT: f32 = BASE_FONT_SIZE * 1.3;
+
+/// Split a label into lines of at most `MAX_LINE_CHARS` characters, breaking at spaces
+/// where possible (a single word longer than a line is split). Approximates how the
+/// canvas wraps labels, without needing the font system.
+pub(crate) fn wrap_label(text: &str) -> impl Iterator<Item = &str> {
+    let max = usize::from(MAX_LINE_CHARS);
+    let mut rest = text.trim();
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        // Byte offset just past `max` characters (labels may contain multi-byte text).
+        let limit = rest
+            .char_indices()
+            .nth(max)
+            .map_or(rest.len(), |(at, _)| at);
+        let cut = if limit == rest.len() || rest[limit..].starts_with(' ') {
+            limit
+        } else {
+            rest[..limit]
+                .rfind(' ')
+                .filter(|&at| at > 0)
+                .unwrap_or(limit)
+        };
+        let (line, tail) = rest.split_at(cut);
+        rest = tail.trim_start();
+        Some(line.trim_end())
+    })
+}
+
 /// Estimated world-space size of a node box with label `text`, without laying out the
-/// text (which needs the font system). Used for fitting the view and for auto-layout.
+/// text (which needs the font system). Used for fitting the view, auto-layout and export.
 pub(crate) fn estimated_size(text: &str) -> Vec2 {
-    // Labels wrap at MAX_LABEL_WIDTH, so counting past one line changes nothing.
-    let chars = text.chars().take(usize::from(MAX_LINE_CHARS)).count();
-    // `take` caps the count, so this conversion cannot actually fail.
-    let chars = u8::try_from(chars).unwrap_or(MAX_LINE_CHARS);
-    let text_width = f32::from(chars) * MAX_LABEL_WIDTH / f32::from(MAX_LINE_CHARS);
-    Vec2::new(text_width, BASE_FONT_SIZE * 1.3) + NODE_PADDING * 2.0
+    let (lines, widest) = wrap_label(text).fold((0_u16, 0_u8), |(lines, widest), line| {
+        // Wrapped lines hold at most MAX_LINE_CHARS characters, so this fits in a u8.
+        let chars = u8::try_from(line.chars().count()).unwrap_or(MAX_LINE_CHARS);
+        (lines.saturating_add(1), widest.max(chars))
+    });
+    let text_width = f32::from(widest) * MAX_LABEL_WIDTH / f32::from(MAX_LINE_CHARS);
+    let text_height = f32::from(lines.max(1)) * LINE_HEIGHT;
+    Vec2::new(text_width, text_height) + NODE_PADDING * 2.0
 }
 
 /// Estimated world-space box of a node.
@@ -382,6 +422,41 @@ mod tests {
         let handle = Pos2::new(rect.max.x + HANDLE_RADIUS * 1.4, rect.center().y);
         assert_eq!(view.hit_test_handle(handle), Some(branch));
         assert_eq!(view.hit_test_handle(rect.center()), None);
+    }
+
+    #[test]
+    fn wrap_label_breaks_at_spaces() {
+        let text = "a fairly long label that certainly needs more than one line";
+
+        let lines: Vec<&str> = wrap_label(text).collect();
+
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= usize::from(MAX_LINE_CHARS))
+        );
+        assert_eq!(lines.join(" "), text);
+    }
+
+    #[test]
+    fn wrap_label_splits_long_words_and_handles_multibyte_text() {
+        let word = "\u{e9}".repeat(usize::from(MAX_LINE_CHARS) + 5);
+
+        let lines: Vec<&str> = wrap_label(&word).collect();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.concat(), word);
+        assert_eq!(wrap_label("   ").count(), 0);
+    }
+
+    #[test]
+    fn longer_labels_are_estimated_wider_then_taller() {
+        let short = estimated_size("hi");
+        let long = estimated_size(&"word ".repeat(20));
+
+        assert!(long.x > short.x);
+        assert!(long.y > short.y);
     }
 
     #[test]

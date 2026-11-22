@@ -75,6 +75,11 @@ impl Camera {
         self.zoom = scale.min_elem().clamp(MIN_ZOOM, 1.0);
         self.offset = screen.center() - world.center() * self.zoom;
     }
+
+    /// Pan (keeping the zoom) so `world` is drawn at screen position `screen`.
+    pub fn look_at(&mut self, world: Point, screen: Pos2) {
+        self.offset = screen - Pos2::new(world.x, world.y) * self.zoom;
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +137,18 @@ mod tests {
             camera.world_to_screen(Point::new(100.0, 0.0)),
             screen.center(),
         );
+    }
+
+    #[test]
+    fn look_at_keeps_zoom() {
+        let mut camera = Camera::default();
+        camera.zoom_at(Pos2::ZERO, 2.0);
+        let world = Point::new(30.0, -10.0);
+
+        camera.look_at(world, Pos2::new(100.0, 100.0));
+
+        assert_eq!(camera.zoom(), 2.0);
+        assert_close(camera.world_to_screen(world), Pos2::new(100.0, 100.0));
     }
 
     #[test]

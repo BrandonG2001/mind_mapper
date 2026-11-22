@@ -1,0 +1,23 @@
+THIRD-PARTY SOFTWARE NOTICES
+============================
+
+Mind Mapper includes the open-source software listed below. Each license is followed by
+its full text; the crates listed under it are used under that license.
+
+Overview of licenses:
+{{#each overview}}
+  - {{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

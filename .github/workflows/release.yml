@@ -38,6 +38,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Generate third-party notices
+        run: cargo about generate --locked about.hbs -o THIRD_PARTY_NOTICES.txt
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
         env:
@@ -47,7 +53,7 @@ jobs:
         run: |
           name="mind_mapper-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.txt "$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/mind_mapper.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null

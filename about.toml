@@ -1,0 +1,32 @@
+# Configuration for `cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt`,
+# which lists every dependency's license for distribution with the app.
+
+# Licenses we may distribute under. Dependencies offering a choice (e.g. "MIT OR LGPL")
+# are listed under the first accepted option, so copyleft options are never selected.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    # Licenses of the fonts embedded by egui (epaint_default_fonts).
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# The platforms release builds are made for.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Only code that ships inside the program needs a notice.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

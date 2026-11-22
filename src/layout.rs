@@ -78,9 +78,12 @@ impl Tidier {
         // Reverse pre-order visits every child before its parent (a post-order).
         for &id in order.iter().rev() {
             let node = map.node(id).ok_or(MapError::NodeNotFound(id))?;
-            if !node.is_collapsed() && !node.children().is_empty() {
-                self.rows[id.index()] = self.rows_of(node.children());
-            }
+            let own = own_rows(node.text());
+            self.rows[id.index()] = if node.is_collapsed() || node.children().is_empty() {
+                own
+            } else {
+                own.max(self.rows_of(node.children()))
+            };
         }
         Ok(())
     }
@@ -131,6 +134,16 @@ impl Tidier {
     }
 }
 
+/// Rows a node needs for its own box: one for a single-line label, more for a label
+/// that wraps, keeping the same spacing between boxes either way.
+fn own_rows(text: &str) -> f32 {
+    let spacing = ROW_HEIGHT - estimated_size("").y;
+    // The small epsilon stops float rounding from turning exactly 1.0 into 2 rows.
+    ((estimated_size(text).y + spacing) / ROW_HEIGHT - 1e-3)
+        .ceil()
+        .max(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +186,22 @@ mod tests {
 
         tidy(&mut map).expect("consistent map");
 
+        assert_no_overlaps(&map);
+    }
+
+    #[test]
+    fn multi_line_labels_get_extra_rows() {
+        let mut map = MindMap::new("root");
+        let origin = Point::default();
+        let long = "a long label that wraps onto several lines in the canvas ".repeat(2);
+        map.add_child_at(map.root(), &long, origin).expect("root");
+        map.add_child_at(map.root(), "short", Point::new(0.0, 1.0))
+            .expect("root");
+
+        tidy(&mut map).expect("consistent map");
+
+        assert!(own_rows(&long) > 1.0);
+        assert!((own_rows("short") - 1.0).abs() < f32::EPSILON);
         assert_no_overlaps(&map);
     }
 
