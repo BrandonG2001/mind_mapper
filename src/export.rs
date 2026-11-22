@@ -11,6 +11,7 @@ use eframe::egui::{Color32, Rect, Visuals};
 use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
+use crate::clipboard;
 use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT, branch_accent, estimated_rect, wrap_label};
 use crate::model::MindMap;
 use crate::storage::{StorageError, write_atomically};
@@ -111,25 +112,15 @@ pub fn export(map: &MindMap, style: ExportStyle, path: &Path) -> Result<(), Expo
 /// bullet in tree order.
 #[must_use]
 pub fn to_markdown(map: &MindMap) -> String {
-    let mut depth = vec![0_usize; map.slot_count()];
+    let root = map.root();
     let mut out = String::new();
-    for visit in map.preorder() {
-        // Line breaks inside a label would end the bullet early.
-        let text = visit.node.text().replace(['\r', '\n'], " ");
-        match visit.node.parent() {
-            None => {
-                out.push_str("# ");
-                out.push_str(&text);
-                out.push_str("\n\n");
-            }
-            Some(parent) => {
-                let level = depth[parent.index()] + 1;
-                depth[visit.id.index()] = level;
-                out.push_str(&"  ".repeat(level - 1));
-                out.push_str("- ");
-                out.push_str(&text);
-                out.push('\n');
-            }
+    if let Some(root_node) = map.node(root) {
+        out.push_str("# ");
+        // A line break inside the title would end the heading early.
+        out.push_str(&root_node.text().replace(['\r', '\n'], " "));
+        out.push_str("\n\n");
+        for &branch in root_node.children() {
+            out.push_str(&clipboard::branch_outline(map, branch));
         }
     }
     out

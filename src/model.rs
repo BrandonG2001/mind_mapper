@@ -235,19 +235,32 @@ impl MindMap {
     ///
     /// An iterator over [`Visit`]s, starting with the root.
     pub fn preorder(&self) -> impl Iterator<Item = Visit<'_>> {
-        self.walk(false)
+        self.walk(self.root, false)
+    }
+
+    /// Walk one branch depth-first: `start` first, then its descendants in tree order.
+    pub fn subtree_preorder(&self, start: NodeId) -> impl Iterator<Item = Visit<'_>> {
+        self.walk(start, false)
+    }
+
+    /// The parent, grandparent and so on of `id`, up to and including the root.
+    pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        // `successors` repeatedly applies the closure: parent, grandparent, ...
+        std::iter::successors(self.node(id).and_then(|node| node.parent), |&ancestor| {
+            self.node(ancestor).and_then(|node| node.parent)
+        })
     }
 
     /// Like [`MindMap::preorder`], but skips the descendants of collapsed nodes: exactly
     /// the nodes that are on screen.
     pub fn visible_preorder(&self) -> impl Iterator<Item = Visit<'_>> {
-        self.walk(true)
+        self.walk(self.root, true)
     }
 
-    fn walk(&self, skip_collapsed: bool) -> impl Iterator<Item = Visit<'_>> {
+    fn walk(&self, start: NodeId, skip_collapsed: bool) -> impl Iterator<Item = Visit<'_>> {
         // An explicit stack instead of recursion, so deep trees cannot overflow the
         // call stack.
-        let mut stack = vec![(self.root, None)];
+        let mut stack = vec![(start, None)];
         std::iter::from_fn(move || {
             let (id, branch) = stack.pop()?;
             let node = self.node(id)?;
@@ -446,9 +459,7 @@ impl MindMap {
     /// Walks up from `node`, so the cost is the depth of `node`, not the subtree size.
     #[must_use]
     pub fn is_in_subtree(&self, node: NodeId, ancestor: NodeId) -> bool {
-        // `successors` repeatedly applies the closure: node, parent, grandparent, ...
-        std::iter::successors(Some(node), |&id| self.node(id).and_then(|n| n.parent))
-            .any(|id| id == ancestor)
+        node == ancestor || self.ancestors(node).any(|id| id == ancestor)
     }
 
     /// Re-attach `id` (with its whole branch) as the last child of `new_parent`, and move
@@ -849,6 +860,18 @@ mod tests {
                 (b, Some(1))
             ]
         );
+    }
+
+    #[test]
+    fn subtree_preorder_and_ancestors() {
+        let (map, a, b, a1) = sample_map();
+
+        let branch: Vec<NodeId> = map.subtree_preorder(a).map(|visit| visit.id).collect();
+        assert_eq!(branch, vec![a, a1]);
+        let ancestors: Vec<NodeId> = map.ancestors(a1).collect();
+        assert_eq!(ancestors, vec![a, map.root()]);
+        assert_eq!(map.ancestors(map.root()).count(), 0);
+        assert_eq!(map.subtree_preorder(b).count(), 1);
     }
 
     #[test]

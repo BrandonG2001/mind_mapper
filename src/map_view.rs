@@ -218,12 +218,24 @@ impl MapView {
     /// * `id` - Node to outline
     /// * `color` - Ring colour
     pub fn outline(&self, painter: &Painter, id: NodeId, color: Color32) {
-        if let Some(rect) = self.node_rect(id) {
-            let zoom = self.camera.zoom();
+        self.outline_where(painter, |candidate| candidate == id, color);
+    }
+
+    /// Draw a highlight ring around every drawn node for which `wanted` is true, in one
+    /// pass over the layout.
+    pub fn outline_where(
+        &self,
+        painter: &Painter,
+        wanted: impl Fn(NodeId) -> bool,
+        color: Color32,
+    ) {
+        let zoom = self.camera.zoom();
+        let stroke = Stroke::new((3.0 * zoom).max(1.5), color);
+        for node in self.layout.iter().filter(|node| wanted(node.id)) {
             painter.rect_stroke(
-                rect.expand(3.0 * zoom),
+                node.rect.expand(3.0 * zoom),
                 CORNER_RADIUS * zoom * 1.4,
-                Stroke::new((3.0 * zoom).max(1.5), color),
+                stroke,
                 StrokeKind::Outside,
             );
         }

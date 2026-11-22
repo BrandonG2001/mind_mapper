@@ -4,9 +4,12 @@
 //! * [`history`] - undo/redo
 //! * [`camera`] - pan and zoom
 //! * [`storage`] - JSON load/save
+//! * [`clipboard`] - cut, copy and paste of branches as outlines
 //! * [`export`] - PNG, SVG and Markdown export
+//! * [`icon`] - the application icon
 //! * [`recovery`] - crash recovery of unsaved work
 //! * [`recent`] - recently used files
+//! * [`search`] - finding nodes by text
 //! * [`templates`] - built-in starting maps
 //! * [`layout`] - automatic, overlap-free layout ("Tidy up")
 //! * [`navigation`] - moving the selection with the arrow keys
@@ -17,14 +20,17 @@
 
 pub mod app;
 pub mod camera;
+pub mod clipboard;
 pub mod export;
 pub mod history;
+pub mod icon;
 pub mod layout;
 pub mod map_view;
 pub mod model;
 pub mod navigation;
 pub mod recent;
 pub mod recovery;
+pub mod search;
 pub mod start_screen;
 pub mod storage;
 pub mod templates;

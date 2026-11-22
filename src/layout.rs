@@ -24,9 +24,33 @@ pub(crate) const ROW_HEIGHT: f32 = 56.0;
 ///
 /// Returns `MapError::NodeNotFound` only if the map is internally inconsistent.
 pub fn tidy(map: &mut MindMap) -> Result<(), MapError> {
-    let order: Vec<NodeId> = map.preorder().map(|visit| visit.id).collect();
+    arrange(map, map.root())
+}
+
+/// Like [`tidy`], but only re-arranges the descendants of `branch`; the branch's own node
+/// and everything outside it stay where they are. Used to lay out pasted branches.
+///
+/// # Errors
+///
+/// Returns `MapError::NodeNotFound` if `branch` does not exist.
+pub fn tidy_branch(map: &mut MindMap, branch: NodeId) -> Result<(), MapError> {
+    arrange(map, branch)
+}
+
+/// Lay out everything below `start` (both sides of the map when `start` is the root).
+fn arrange(map: &mut MindMap, start: NodeId) -> Result<(), MapError> {
+    let start_node = map.node(start).ok_or(MapError::NodeNotFound(start))?;
+    let order: Vec<NodeId> = map.subtree_preorder(start).map(|visit| visit.id).collect();
     let mut tidier = Tidier::new(map.slot_count());
     tidier.count_rows(map, &order)?;
+    // A branch keeps growing away from its parent.
+    if let Some(parent) = start_node.parent().and_then(|id| map.node(id)) {
+        tidier.direction[start.index()] = if start_node.position().x < parent.position().x {
+            -1.0
+        } else {
+            1.0
+        };
+    }
 
     let root = map.root();
     let root_x = map
@@ -203,6 +227,23 @@ mod tests {
         assert!(own_rows(&long) > 1.0);
         assert!((own_rows("short") - 1.0).abs() < f32::EPSILON);
         assert_no_overlaps(&map);
+    }
+
+    #[test]
+    fn tidy_branch_only_moves_that_branch() {
+        let (mut map, a, b) = piled_up_map();
+        map.set_position(a, Point::new(-300.0, 0.0)).expect("a");
+        let b_before = map.node(b).expect("b").position();
+        let a_before = map.node(a).expect("a").position();
+
+        tidy_branch(&mut map, a).expect("a exists");
+
+        assert_eq!(map.node(b).expect("b").position(), b_before);
+        assert_eq!(map.node(a).expect("a").position(), a_before);
+        // `a` is on the left of the root, so its children grow further left.
+        for &child in map.node(a).expect("a").children() {
+            assert!(map.node(child).expect("child").position().x < a_before.x);
+        }
     }
 
     #[test]

@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, FontId, Key, KeyboardShortcut, Modifiers, PointerButton, Rect, Response, Sense,
-    Ui, Vec2, ViewportCommand,
+    self, Align2, Event, FontId, Key, KeyboardShortcut, Modifiers, PointerButton, Rect, Response,
+    Sense, Ui, Vec2, ViewportCommand,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
+use crate::clipboard;
 use crate::export::{self, ExportStyle};
 use crate::history::History;
 use crate::layout;
@@ -17,6 +18,7 @@ use crate::model::{MapError, MindMap, Node, NodeId};
 use crate::navigation::{self, Direction};
 use crate::recent::RecentFiles;
 use crate::recovery::{Recovered, RecoveryStore};
+use crate::search::{Search, SearchCommand};
 use crate::start_screen::{StartChoice, StartContext, StartScreen};
 use crate::storage;
 use crate::theme::{ColorTheme, theme_picker};
@@ -55,11 +57,23 @@ enum Action {
     ToggleCollapse,
     Navigate(Direction),
     Export,
+    Find,
+    FindNext,
+    FindPrevious,
+    CloseFind,
+}
+
+/// A clipboard request, which egui reports as an event rather than a key press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClipboardRequest {
+    Copy,
+    Cut,
+    Paste(String),
 }
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 19] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 23] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S),
         Action::SaveAs,
@@ -115,6 +129,22 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 19] = [
     (
         KeyboardShortcut::new(Modifiers::NONE, Key::Space),
         Action::ToggleCollapse,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::SHIFT, Key::F3),
+        Action::FindPrevious,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::F3),
+        Action::FindNext,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::F),
+        Action::Find,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
+        Action::CloseFind,
     ),
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::E),
@@ -202,6 +232,10 @@ pub struct MindMapApp {
     last_autosave: f64,
     /// Recently opened or saved files, shown on the start screen.
     recent: RecentFiles,
+    /// The open find bar, if any.
+    search: Option<Search>,
+    /// Increases with every edit, so cached results (search matches) know to refresh.
+    revision: u64,
 }
 
 impl MindMapApp {
@@ -263,6 +297,8 @@ impl MindMapApp {
             autosave_pending: false,
             last_autosave: 0.0,
             recent: RecentFiles::default(),
+            search: None,
+            revision: 0,
         }
     }
 
@@ -270,6 +306,7 @@ impl MindMapApp {
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.autosave_pending = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Write a recovery copy if there are new changes and enough time has passed.
@@ -403,6 +440,13 @@ impl MindMapApp {
             }
             Action::Export => self.export_dialog(),
             Action::Navigate(direction) => self.navigate(direction),
+            Action::Find => match &mut self.search {
+                Some(search) => search.request_focus(),
+                None => self.search = Some(Search::new()),
+            },
+            Action::FindNext => self.search_command(SearchCommand::Next),
+            Action::FindPrevious => self.search_command(SearchCommand::Previous),
+            Action::CloseFind => self.search = None,
         }
     }
 
@@ -659,6 +703,7 @@ impl MindMapApp {
                 true,
                 "Ctrl+E: PNG, SVG or Markdown",
             ),
+            ("Find", Action::Find, true, "Ctrl+F"),
             (
                 "Tidy up",
                 Action::Tidy,
@@ -860,6 +905,13 @@ impl MindMapApp {
         self.handle_pointer(ui, &response);
         self.view
             .paint(&painter, ui.visuals(), &self.map, self.selected);
+        if let Some(search) = &self.search {
+            self.view.outline_where(
+                &painter,
+                |id| search.is_match(id),
+                ui.visuals().warn_fg_color,
+            );
+        }
         if let Some(Drag::Node {
             drop_target: Some(target),
             ..
@@ -869,6 +921,81 @@ impl MindMapApp {
                 .outline(&painter, target, ui.visuals().selection.stroke.color);
         }
         self.show_editor(ui);
+    }
+
+    /// Act on a find-bar command: jump to the first, next or previous match, or close.
+    fn search_command(&mut self, command: SearchCommand) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.refresh(&self.map, self.revision);
+        let target = match command {
+            SearchCommand::QueryChanged => search.first(),
+            SearchCommand::Next => search.step(true),
+            SearchCommand::Previous => search.step(false),
+            SearchCommand::Close => {
+                self.search = None;
+                return;
+            }
+        };
+        if let Some(id) = target {
+            self.show_node(id);
+        }
+    }
+
+    /// Select `id`, unfold any folded branches hiding it (one undo step), and scroll to it.
+    fn show_node(&mut self, id: NodeId) {
+        let folded: Vec<NodeId> = self
+            .map
+            .ancestors(id)
+            .filter(|&ancestor| self.map.node(ancestor).is_some_and(Node::is_collapsed))
+            .collect();
+        if !folded.is_empty() {
+            self.edit_map(|map| {
+                folded
+                    .iter()
+                    .try_for_each(|&ancestor| map.set_collapsed(ancestor, false))
+            });
+        }
+        self.selected = Some(id);
+        self.reveal = Some(id);
+    }
+
+    /// Copy the selected branch (or the whole map) to the system clipboard as an outline,
+    /// removing it from the map when `cut` is true.
+    fn copy_branch(&mut self, ctx: &egui::Context, cut: bool) {
+        let root = self.map.root();
+        let branch = self.selected.unwrap_or(root);
+        if cut && branch == root {
+            "Select a branch to cut; the central idea cannot be removed"
+                .clone_into(&mut self.status);
+            return;
+        }
+        ctx.copy_text(clipboard::branch_outline(&self.map, branch));
+        if cut {
+            self.selected = Some(branch);
+            self.perform(Action::Delete);
+            "Cut to the clipboard".clone_into(&mut self.status);
+        } else {
+            "Copied to the clipboard".clone_into(&mut self.status);
+        }
+    }
+
+    /// Paste an outline from the clipboard as new branches under the selected node.
+    fn paste_outline(&mut self, text: &str) {
+        let items = clipboard::parse_outline(text);
+        if items.is_empty() {
+            "Nothing to paste: the clipboard holds no text".clone_into(&mut self.status);
+            return;
+        }
+        let target = self.selected.unwrap_or_else(|| self.map.root());
+        if let Some(branches) = self.edit_map(|map| clipboard::paste(map, target, &items)) {
+            self.status = format!("Pasted {} nodes", items.len());
+            if let Some(&first) = branches.first() {
+                self.selected = Some(first);
+                self.reveal = Some(first);
+            }
+        }
     }
 
     /// Pan (without zooming) so `id` is comfortably inside `canvas`, if it isn't already.
@@ -908,7 +1035,8 @@ impl MindMapApp {
     }
 
     fn handle_shortcuts(&mut self, ui: &Ui) {
-        if self.editing.is_some() {
+        // While a text field has focus, keys (and Ctrl+C/X/V) belong to it.
+        if self.editing.is_some() || self.search.as_ref().is_some_and(Search::has_focus) {
             return;
         }
         let ctx = ui.ctx();
@@ -930,6 +1058,23 @@ impl MindMapApp {
         });
         if let Some(action) = pressed {
             self.perform(action);
+        }
+        if on_start {
+            return;
+        }
+        let request = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                Event::Copy => Some(ClipboardRequest::Copy),
+                Event::Cut => Some(ClipboardRequest::Cut),
+                Event::Paste(text) => Some(ClipboardRequest::Paste(text.clone())),
+                _ => None,
+            })
+        });
+        match request {
+            Some(ClipboardRequest::Copy) => self.copy_branch(ctx, false),
+            Some(ClipboardRequest::Cut) => self.copy_branch(ctx, true),
+            Some(ClipboardRequest::Paste(text)) => self.paste_outline(&text),
+            None => {}
         }
     }
 }
@@ -977,6 +1122,15 @@ impl eframe::App for MindMapApp {
             .inner;
         if let Some(action) = clicked {
             self.perform(action);
+        }
+        if let Some(search) = &mut self.search {
+            search.refresh(&self.map, self.revision);
+            let command = egui::Panel::top("find_bar")
+                .show(ui, |ui| search.show(ui))
+                .inner;
+            if let Some(command) = command {
+                self.search_command(command);
+            }
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
     }
@@ -1203,6 +1357,57 @@ mod tests {
         app.export_to(&dir.path().join("map.txt"));
 
         assert!(app.status.starts_with("Could not export map.txt"));
+    }
+
+    #[test]
+    fn search_jumps_to_matches_and_unfolds_hidden_ones() {
+        let (mut app, child) = app_with_child();
+        app.edit_map(|map| map.set_text(child, "Needle"))
+            .expect("child");
+        let hidden = app
+            .edit_map(|map| map.add_child(child, "another needle"))
+            .expect("child");
+        app.toggle_collapse(child);
+        assert!(app.map.node(child).expect("child").is_collapsed());
+
+        app.perform(Action::Find);
+        app.search
+            .as_mut()
+            .expect("find bar open")
+            .set_query("needle");
+        app.search_command(SearchCommand::QueryChanged);
+        assert_eq!(app.selected, Some(child));
+        app.perform(Action::FindNext);
+
+        assert_eq!(app.selected, Some(hidden));
+        assert!(!app.map.node(child).expect("child").is_collapsed());
+        assert_eq!(app.reveal, Some(hidden));
+        app.perform(Action::CloseFind);
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn copy_cut_and_paste_branches() {
+        let ctx = egui::Context::default();
+        let (mut app, child) = app_with_child();
+        app.edit_map(|map| map.add_child(child, "grandchild"))
+            .expect("child");
+        let outline = clipboard::branch_outline(&app.map, child);
+        app.selected = Some(child);
+
+        app.copy_branch(&ctx, true);
+        assert!(app.map.node(child).is_none());
+        app.selected = Some(app.map.root());
+        app.paste_outline(&outline);
+
+        let pasted = app.selected.expect("pasted branch selected");
+        assert_eq!(clipboard::branch_outline(&app.map, pasted), outline);
+        assert_eq!(app.status, "Pasted 2 nodes");
+        app.selected = Some(app.map.root());
+        app.copy_branch(&ctx, true);
+        assert!(app.status.starts_with("Select a branch to cut"));
+        app.paste_outline("   ");
+        assert!(app.status.starts_with("Nothing to paste"));
     }
 
     #[test]

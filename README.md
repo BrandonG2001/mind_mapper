@@ -23,6 +23,9 @@ keyboard, drag branches around and save your maps as plain JSON files.
   when the map is saved.
 - **Recent files** on the start screen for quick access to the maps you use most.
 - **Export** to a PNG image, an SVG drawing or a Markdown outline.
+- **Find** any node by its text; matches are highlighted and folded branches open as needed.
+- **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
+  document, or paste a bulleted list from anywhere into the map.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
   dragging the background.
 - **Undo/redo**: up to 200 steps.
@@ -100,6 +103,9 @@ mind_mapper path/to/ideas.json
 | Space | Collapse or expand the selected node's branch |
 | Arrow keys | Move the selection: Left/Right go out to a child or back to the parent (mirrored on the left half of the map), Up/Down go between siblings |
 | Ctrl+E | Export as PNG, SVG or Markdown (chosen by the file extension) |
+| Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
+| Ctrl+C / Ctrl+X | Copy / cut the selected branch (or copy the whole map) as an indented outline |
+| Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
 | Ctrl+O | Open a map |
@@ -191,10 +197,21 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/recent.rs`](src/recent.rs) | The recent-files list |
 | [`src/navigation.rs`](src/navigation.rs) | Arrow-key movement between nodes |
 | [`src/export.rs`](src/export.rs) | PNG, SVG and Markdown export |
+| [`src/search.rs`](src/search.rs) | The find bar and node matching |
+| [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
+| [`src/icon.rs`](src/icon.rs) | The window icon, drawn from `assets/icon.svg` |
+| [`build.rs`](build.rs) | Embeds `assets/icon.ico` in the Windows executable |
 | [`src/map_view.rs`](src/map_view.rs) | Drawing a map (used by the editor and the thumbnails) |
 | [`src/start_screen.rs`](src/start_screen.rs) | The template gallery |
 | [`src/theme.rs`](src/theme.rs) | Colour themes and saving the chosen one |
 | [`src/app.rs`](src/app.rs) | The application window, toolbar and input handling |
+
+### Changing the icon
+
+[`assets/icon.svg`](assets/icon.svg) is the source artwork; the window icon is drawn from it
+at startup. Windows also needs [`assets/icon.ico`](assets/icon.ico) (16 to 256 px) for the
+executable's icon, so regenerate that file from the SVG after editing it, with any SVG-to-ICO
+converter.
 
 ### Adding a template
 
