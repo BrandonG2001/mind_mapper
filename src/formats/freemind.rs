@@ -3,8 +3,9 @@
 //!
 //! Each `<node>` carries its label in `TEXT` (or, for formatted labels, an HTML
 //! `<richcontent TYPE="NODE">`), its notes in `<richcontent TYPE="NOTE">`, its link in
-//! `LINK`, its colour in `COLOR`, its folded state in `FOLDED` and, for branches of the
-//! root, its side in `POSITION`.
+//! `LINK`, its colour in `COLOR`, its folded state in `FOLDED`, for branches of the
+//! root its side in `POSITION`, and cross-links as `<arrowlink DESTINATION="..."/>`
+//! naming another node's `ID`.
 
 use roxmltree::{Document, Node as XmlNode};
 
@@ -80,7 +81,17 @@ fn read_node(element: XmlNode<'_, '_>) -> NodeFields {
             .and_then(|color| NodeColor::try_from(color.to_owned()).ok()),
         folded: element.attribute("FOLDED") == Some("true"),
         left: element.attribute("POSITION").map(|side| side == "left"),
+        file_id: element.attribute("ID").map(str::to_owned),
+        links_to: elements(element, "arrowlink")
+            .filter_map(|arrow| arrow.attribute("DESTINATION"))
+            .map(str::to_owned)
+            .collect(),
     }
+}
+
+/// The `ID` written for node `id`, which arrow links refer to.
+fn file_id(id: NodeId) -> String {
+    format!("ID_{}", id.index())
 }
 
 /// The text of the HTML inside `content`: one line per paragraph (or line break, list
@@ -123,7 +134,7 @@ impl Dialect for FreeMind {
     const TAG: &'static str = "node";
 
     fn attributes(&self, _map: &MindMap, id: NodeId, node: &Node, out: &mut String) {
-        push_attribute(out, "ID", &format!("ID_{}", id.index()));
+        push_attribute(out, "ID", &file_id(id));
         push_attribute(out, "TEXT", node.text());
         if node.parent() == Some(self.root) {
             let side = if node.position().x < self.root_x {
@@ -144,22 +155,28 @@ impl Dialect for FreeMind {
         }
     }
 
-    fn has_content(&self, node: &Node) -> bool {
-        !node.note().is_empty()
+    fn has_content(&self, map: &MindMap, id: NodeId, node: &Node) -> bool {
+        !node.note().is_empty() || map.cross_links().iter().any(|link| link.from() == id)
     }
 
-    fn content(&self, node: &Node, indent: usize, out: &mut String) {
-        if node.note().is_empty() {
-            return;
+    fn content(&self, map: &MindMap, id: NodeId, indent: usize, out: &mut String) {
+        let note = map.node(id).map_or("", Node::note);
+        if !note.is_empty() {
+            push_indent(out, indent);
+            out.push_str("<richcontent TYPE=\"NOTE\"><html><head></head><body>");
+            for line in note.lines() {
+                out.push_str("<p>");
+                push_escaped(out, line);
+                out.push_str("</p>");
+            }
+            out.push_str("</body></html></richcontent>\n");
         }
-        push_indent(out, indent);
-        out.push_str("<richcontent TYPE=\"NOTE\"><html><head></head><body>");
-        for line in node.note().lines() {
-            out.push_str("<p>");
-            push_escaped(out, line);
-            out.push_str("</p>");
+        for link in map.cross_links().iter().filter(|link| link.from() == id) {
+            push_indent(out, indent);
+            out.push_str("<arrowlink");
+            push_attribute(out, "DESTINATION", &file_id(link.to()));
+            out.push_str("/>\n");
         }
-        out.push_str("</body></html></richcontent>\n");
     }
 }
 
@@ -241,6 +258,39 @@ mod tests {
         assert_eq!(left_back.note(), "Line one\nLine & two");
         assert_eq!(left_back.link(), Some("https://example.com"));
         assert_eq!(read_back.len(), map.len());
+    }
+
+    #[test]
+    fn arrow_links_become_cross_links_and_back() {
+        let map = read(
+            r#"<map><node TEXT="root" ID="a">
+              <node TEXT="x" ID="b">
+                <arrowlink DESTINATION="c"/>
+                <arrowlink DESTINATION="b"/>
+                <arrowlink DESTINATION="missing"/>
+              </node>
+              <node TEXT="y" ID="c"><arrowlink DESTINATION="b"/></node>
+            </node></map>"#,
+        )
+        .expect("valid");
+        let text_of = |map: &MindMap, id| map.node(id).expect("live").text().to_owned();
+
+        // The link points forward in the file; a link to itself, one to a missing node
+        // and the same link back again are left out.
+        assert_eq!(map.cross_links().len(), 1);
+        let link = map.cross_links()[0];
+        assert_eq!(
+            (text_of(&map, link.from()), text_of(&map, link.to())),
+            ("x".into(), "y".into())
+        );
+
+        let back = read(&write(&map)).expect("own output is valid");
+        let link = back.cross_links()[0];
+        assert_eq!(back.cross_links().len(), 1);
+        assert_eq!(
+            (text_of(&back, link.from()), text_of(&back, link.to())),
+            ("x".into(), "y".into())
+        );
     }
 
     #[test]

@@ -1047,3 +1047,34 @@ fn update_check_results_are_shown_or_remembered() {
     app.check_for_update_if_due(None);
     assert!(app.updates.job.is_none());
 }
+
+#[test]
+fn links_start_from_the_selection_and_finish_on_a_click() {
+    let (mut app, [a, b, c]) = app_with_three_children();
+    app.select(None);
+    app.perform(Action::StartLink);
+    assert_eq!(app.linking, None, "nothing selected to link from");
+
+    app.select(Some(a));
+    app.perform(Action::StartLink);
+    assert_eq!(app.linking, Some(a));
+    app.finish_link(a, Some(c));
+    assert_eq!(app.status, "Linked \"a\" to \"c\"");
+    assert_eq!(app.links_of(a), [(c, true)]);
+    assert_eq!(app.links_of(c), [(a, false)]);
+
+    // Already linked (either way): the status says so and nothing changes.
+    app.finish_link(c, Some(a));
+    assert_eq!(app.status, MapError::DuplicateLink.to_string());
+    // Esc cancels a link in progress before anything else.
+    app.perform(Action::StartLink);
+    app.search = Some(Search::new());
+    app.perform(Action::Dismiss);
+    assert_eq!((app.linking, app.search.is_some()), (None, true));
+
+    app.remove_link(c, a);
+    assert_eq!(app.links_of(a), []);
+    app.perform(Action::Undo);
+    assert_eq!(app.links_of(b), []);
+    assert_eq!(app.links_of(a), [(c, true)]);
+}

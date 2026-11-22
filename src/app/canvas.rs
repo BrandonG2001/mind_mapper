@@ -7,6 +7,7 @@ use eframe::egui::{
 
 use super::{
     Action, Drag, EDITOR_PADDING, MIN_EDITOR_WIDTH, MindMapApp, NEW_NODE_TEXT, SCROLL_ZOOM_SPEED,
+    node_label,
 };
 use crate::details::{self, DetailsPanel, color_palette};
 use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT};
@@ -120,6 +121,10 @@ impl MindMapApp {
             self.perform_on(hit, Action::Rename);
         } else if response.clicked() {
             self.commit_edit();
+            if let Some(source) = self.linking.take() {
+                self.finish_link(source, hit);
+                return;
+            }
             match hit {
                 Some(id) if modifiers.command => self.toggle_selected(id),
                 // Ctrl+click on empty canvas keeps the selection.
@@ -248,6 +253,14 @@ impl MindMapApp {
             main == Some(id) || others.contains(&id)
         });
         self.describe_nodes(ui, &response);
+        if let (Some(source), Some(pointer)) = (self.linking, response.hover_pos()) {
+            self.view.paint_pending_link(
+                &painter,
+                source,
+                pointer,
+                ui.visuals().selection.stroke.color,
+            );
+        }
         if let Some(search) = &self.search {
             self.view.outline_where(
                 &painter,
@@ -339,6 +352,7 @@ impl MindMapApp {
                 can_move(Direction::Down),
                 "Alt+Down",
             ),
+            ("Link to...", Action::StartLink, true, "Ctrl+K"),
             (
                 "Delete",
                 Action::Delete,
@@ -351,6 +365,21 @@ impl MindMapApp {
             if ui.add_enabled(enabled, button).clicked() {
                 self.focus(id);
                 self.perform(action);
+                ui.close();
+            }
+        }
+        let links = self.links_of(id);
+        if !links.is_empty() {
+            ui.separator();
+        }
+        for (other, outgoing) in links {
+            let direction = if outgoing { "to" } else { "from" };
+            let label = format!(
+                "Remove link {direction} \"{}\"",
+                node_label(&self.map, other)
+            );
+            if ui.button(label).clicked() {
+                self.remove_link(id, other);
                 ui.close();
             }
         }

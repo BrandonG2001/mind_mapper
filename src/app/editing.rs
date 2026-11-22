@@ -83,6 +83,7 @@ impl MindMapApp {
     pub(super) fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
         self.map = map;
         self.view.set_focus(None);
+        self.linking = None;
         self.history = History::new(HISTORY_LIMITS);
         self.select(None);
         self.editing = None;

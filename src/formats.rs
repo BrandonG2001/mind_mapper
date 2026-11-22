@@ -1,13 +1,14 @@
 //! Maps in other apps' formats: OPML outlines and FreeMind (`.mm`) mind maps.
 //!
 //! Both are XML trees with one element per node. Importing keeps labels, notes and links,
-//! plus colours, folded branches and sides from FreeMind. Neither format stores positions
+//! plus colours, folded branches, sides and cross-links (arrow links) from FreeMind. Neither format stores positions
 //! the way this app does, so imported maps are arranged by Tidy up; exports carry the same
 //! details back out.
 
 pub mod freemind;
 pub mod opml;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -87,6 +88,10 @@ struct NodeFields {
     folded: bool,
     /// For a branch of the root: `Some(true)` if the file puts it on the left.
     left: Option<bool>,
+    /// The node's identifier in the file, which cross-links refer to.
+    file_id: Option<String>,
+    /// Identifiers of the nodes this one has cross-links to.
+    links_to: Vec<String>,
 }
 
 /// The child elements of `parent` named `tag`, in document order.
@@ -110,6 +115,10 @@ fn build_map(
     let mut builder = TreeBuilder::new(&root.text);
     let root_id = builder.root();
     apply(builder.map_mut(), root_id, root)?;
+    // Cross-links can point forward in the file, so they are joined up at the end.
+    let mut ids: HashMap<String, NodeId> = HashMap::new();
+    let mut pending: Vec<(NodeId, String)> = Vec::new();
+    remember_links(&mut ids, &mut pending, root_id, root);
     let top: Vec<XmlNode<'_, '_>> = elements(branches, tag).collect();
     // An explicit stack instead of recursion, so deeply nested files cannot overflow the
     // call stack. Each entry: element, parent node, side if the file does not say.
@@ -124,11 +133,34 @@ fn build_map(
         let left = fields.left.unwrap_or(default_left);
         let id = builder.add(parent, &fields.text, left)?;
         apply(builder.map_mut(), id, &fields)?;
+        remember_links(&mut ids, &mut pending, id, &fields);
         // Reversed, so the first child is taken off the stack (and added) first.
         let children: Vec<XmlNode<'_, '_>> = elements(element, tag).collect();
         stack.extend(children.into_iter().rev().map(|child| (child, id, false)));
     }
+    for (from, target) in pending {
+        if let Some(&to) = ids.get(&target) {
+            // Links a file repeats or points from a node to itself are left out.
+            match builder.map_mut().add_cross_link(from, to) {
+                Ok(()) | Err(MapError::DuplicateLink | MapError::LinkToSelf) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
     builder.finish()
+}
+
+/// Note node `id`'s file identifier, and the cross-links it starts, for [`build_map`].
+fn remember_links(
+    ids: &mut HashMap<String, NodeId>,
+    pending: &mut Vec<(NodeId, String)>,
+    id: NodeId,
+    fields: &NodeFields,
+) {
+    if let Some(file_id) = &fields.file_id {
+        ids.insert(file_id.clone(), id);
+    }
+    pending.extend(fields.links_to.iter().map(|target| (id, target.clone())));
 }
 
 /// Give node `id` the details in `fields` (its label is set when it is created).
@@ -163,14 +195,14 @@ trait Dialect {
     /// Write the element's attributes, each with a leading space (see [`push_attribute`]).
     fn attributes(&self, map: &MindMap, id: NodeId, node: &Node, out: &mut String);
 
-    /// Whether [`Dialect::content`] writes anything for `node`.
-    fn has_content(&self, _node: &Node) -> bool {
+    /// Whether [`Dialect::content`] writes anything for node `id`.
+    fn has_content(&self, _map: &MindMap, _id: NodeId, _node: &Node) -> bool {
         false
     }
 
-    /// Write what goes inside the element before its children, as lines indented by
-    /// `indent` levels.
-    fn content(&self, _node: &Node, _indent: usize, _out: &mut String) {}
+    /// Write what goes inside node `id`'s element before its children, as lines indented
+    /// by `indent` levels.
+    fn content(&self, _map: &MindMap, _id: NodeId, _indent: usize, _out: &mut String) {}
 }
 
 /// Write the branch at `start` as nested `D::TAG` elements, one per line, the outermost
@@ -205,12 +237,12 @@ fn write_tree<D: Dialect>(
                 out.push('<');
                 out.push_str(D::TAG);
                 dialect.attributes(map, id, node, out);
-                if node.children().is_empty() && !dialect.has_content(node) {
+                if node.children().is_empty() && !dialect.has_content(map, id, node) {
                     out.push_str("/>\n");
                     continue;
                 }
                 out.push_str(">\n");
-                dialect.content(node, depth + 1, out);
+                dialect.content(map, id, depth + 1, out);
                 stack.push(Step::Close(depth));
                 stack.extend(
                     node.children()

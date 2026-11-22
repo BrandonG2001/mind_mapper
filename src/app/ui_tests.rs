@@ -150,12 +150,8 @@ fn right_click_opens_the_node_menu_and_rename_works() {
     harness.run();
     harness.get_by_label("Notes and link...");
     harness.get_by_label("Colour #4e79a7");
-    // The toolbar has a Rename button too; the menu's is the one lower down.
-    harness
-        .get_all_by_label("Rename")
-        .max_by(|a, b| a.rect().center().y.total_cmp(&b.rect().center().y))
-        .expect("menu has Rename")
-        .click();
+    // The menu's button also shows its shortcut, which tells it apart from the toolbar's.
+    harness.get_by_label_contains("F2").click();
     harness.run();
 
     let app = harness.state();
@@ -477,4 +473,42 @@ fn screen_readers_see_each_node_nested_like_the_map() {
         (bounds.x0 - f64::from(drawn.min.x)).abs() < 1.0,
         "{bounds:?} {drawn:?}"
     );
+}
+
+#[test]
+fn link_to_from_the_menu_then_click_the_target() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let (risk, goals) = {
+        let app = harness.state();
+        (node_named(app, "Risk"), node_named(app, "Goals"))
+    };
+    let right_click = |harness: &mut Harness<'static, MindMapApp>, id| {
+        let pos = center_of(harness.state(), id);
+        for pressed in [true, false] {
+            harness.event(Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        harness.run();
+    };
+
+    right_click(&mut harness, risk);
+    harness.get_by_label_contains("Link to...").click();
+    harness.run();
+    click_with(&mut harness, goals, Modifiers::NONE);
+
+    assert_eq!(harness.state().links_of(risk), [(goals, true)]);
+    assert_eq!(harness.state().status, "Linked \"Risk\" to \"Goals\"");
+    // Screen readers hear about the link too.
+    let described = harness.get_by_label("Risk").accesskit_node().description();
+    assert_eq!(described.as_deref(), Some("Links to Goals"));
+
+    right_click(&mut harness, goals);
+    harness.get_by_label("Remove link from \"Risk\"").click();
+    harness.run();
+    assert_eq!(harness.state().links_of(goals), []);
 }

@@ -3,10 +3,12 @@
 //! "Mind map" tree, nested like the map. (UI tests find nodes the same way.)
 
 use std::collections::HashMap;
+// `write!` into a `String` needs this trait in scope.
+use std::fmt::Write as _;
 
 use eframe::egui::{Response, Ui, UiBuilder, accesskit};
 
-use super::MindMapApp;
+use super::{MindMapApp, node_label};
 use crate::model::NodeId;
 
 impl MindMapApp {
@@ -48,6 +50,7 @@ impl MindMapApp {
                 ),
             );
             let selected = self.is_selected(id);
+            let description = self.node_description(id);
             ctx.accesskit_node_builder(item, |builder| {
                 builder.set_bounds(accesskit::Rect {
                     x0: rect.min.x.into(),
@@ -60,8 +63,8 @@ impl MindMapApp {
                 if !node.children().is_empty() {
                     builder.set_expanded(!node.is_collapsed());
                 }
-                if !node.note().is_empty() {
-                    builder.set_description(node.note());
+                if !description.is_empty() {
+                    builder.set_description(description);
                 }
                 builder.add_action(accesskit::Action::Click);
             });
@@ -73,5 +76,22 @@ impl MindMapApp {
         if activated.is_some() {
             self.select(activated);
         }
+    }
+
+    /// What a screen reader says about `id` after its label: its notes, then its links.
+    fn node_description(&self, id: NodeId) -> String {
+        let mut description = self
+            .map
+            .node(id)
+            .map_or_else(String::new, |node| node.note().to_owned());
+        for (other, outgoing) in self.links_of(id) {
+            if !description.is_empty() {
+                description.push('\n');
+            }
+            let direction = if outgoing { "Links to" } else { "Linked from" };
+            write!(description, "{direction} {}", node_label(&self.map, other))
+                .expect("writing into a String cannot fail");
+        }
+        description
     }
 }

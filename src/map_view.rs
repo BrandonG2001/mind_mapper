@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 
 use crate::camera::Camera;
-use crate::model::{MindMap, Node, NodeColor, NodeId, Visit};
+use crate::model::{MindMap, Node, NodeColor, NodeId, Point, Visit};
 
 /// Font size of node labels at 100% zoom.
 pub const BASE_FONT_SIZE: f32 = 16.0;
@@ -24,6 +24,14 @@ const MAX_LINE_CHARS: u8 = 28;
 const HANDLE_RADIUS: f32 = 8.0;
 /// Rounded-corner radius of node boxes at 100% zoom.
 const CORNER_RADIUS: f32 = 8.0;
+/// Width of cross-link lines at 100% zoom.
+pub(crate) const LINK_WIDTH: f32 = 1.5;
+/// Dash and gap lengths of cross-link lines at 100% zoom.
+pub(crate) const LINK_DASH: [f32; 2] = [6.0, 4.0];
+/// Opacity of cross-links, so they read as secondary to the tree.
+pub(crate) const LINK_OPACITY: f32 = 0.6;
+/// Length of a cross-link's arrowhead at 100% zoom.
+pub(crate) const ARROW_SIZE: f32 = 9.0;
 /// Accent colours cycled through for the root's branches.
 const BRANCH_COLORS: [Color32; 6] = [
     Color32::from_rgb(0x4e, 0x79, 0xa7),
@@ -58,6 +66,9 @@ pub struct MapView {
     accents: Accents,
     /// The branch shown on its own in focus mode; `None` shows the whole map.
     focus: Option<NodeId>,
+    /// Reused every frame: `shown[i]` is whether the node in slot `i` is on the map this
+    /// frame (not folded away or outside the focused branch), drawn or scrolled off.
+    shown: Vec<bool>,
 }
 
 impl MapView {
@@ -128,8 +139,11 @@ impl MapView {
         let start = self.start(map);
         self.accents.reset(map);
         self.accents.prime(map, start, text_color);
+        self.shown.clear();
+        self.shown.resize(map.slot_count(), false);
         let handle_radius = HANDLE_RADIUS * zoom;
         for visit in map.visible_subtree_preorder(start) {
+            self.shown[visit.id.index()] = true;
             let accent = self.accents.resolve(map, &visit, text_color);
             let center = self.camera.world_to_screen(visit.node.position());
             // Which way the branch grows: away from the parent (the root has no handle).
@@ -182,6 +196,8 @@ impl MapView {
             }
         }
 
+        self.paint_cross_links(painter, map, text_color);
+
         let radius = CORNER_RADIUS * zoom;
         let fill = visuals.window_fill();
         let selection = visuals.selection.stroke.color;
@@ -223,6 +239,52 @@ impl MapView {
                 paint_handle(painter, node, handle, handle_radius, fill);
             }
         }
+    }
+
+    /// Draw the cross-links whose ends are both on the map, under the node boxes.
+    fn paint_cross_links(&self, painter: &Painter, map: &MindMap, color: Color32) {
+        let zoom = self.camera.zoom();
+        let stroke = Stroke::new(
+            (LINK_WIDTH * zoom).max(1.0),
+            color.gamma_multiply(LINK_OPACITY),
+        );
+        let shown = |id: NodeId| self.shown.get(id.index()).copied().unwrap_or(false);
+        for link in map.cross_links() {
+            let (Some(from), Some(to)) = (map.node(link.from()), map.node(link.to())) else {
+                continue;
+            };
+            if !shown(link.from()) || !shown(link.to()) {
+                continue;
+            }
+            let curve = cross_link_curve(estimated_rect(from), estimated_rect(to))
+                .map(|point| self.camera.world_to_screen(Point::new(point.x, point.y)));
+            if !painter.clip_rect().intersects(Rect::from_points(&curve)) {
+                continue;
+            }
+            paint_cross_link(painter, curve, stroke, zoom);
+        }
+    }
+
+    /// Draw the link being made from node `from` (if it was drawn) to the mouse pointer at
+    /// `cursor`, in `color`.
+    pub fn paint_pending_link(
+        &self,
+        painter: &Painter,
+        from: NodeId,
+        cursor: Pos2,
+        color: Color32,
+    ) {
+        let Some(start) = self.node_rect(from) else {
+            return;
+        };
+        let zoom = self.camera.zoom();
+        let curve = cross_link_curve(start, Rect::from_center_size(cursor, Vec2::ZERO));
+        paint_cross_link(
+            painter,
+            curve,
+            Stroke::new((LINK_WIDTH * zoom).max(1.0), color),
+            zoom,
+        );
     }
 
     /// The node whose collapse/expand handle is at `screen`, from the last paint call.
@@ -313,6 +375,77 @@ impl MapView {
             .find(|node| node.id == id)
             .map(|node| node.rect)
     }
+}
+
+/// The curve of a cross-link between the boxes `from` and `to` (in any one coordinate
+/// space): a cubic from edge to edge that bows to one side, so it stands out from the
+/// tree's own lines.
+pub(crate) fn cross_link_curve(from: Rect, to: Rect) -> [Pos2; 4] {
+    let (start, end) = (from.center(), to.center());
+    let span = end - start;
+    if span.length() < f32::EPSILON {
+        return [start; 4];
+    }
+    // A quarter of the distance to the side, at a third and two thirds of the way.
+    let bow = span.rot90() * 0.25;
+    let first = start + span / 3.0 + bow;
+    let second = start + span * (2.0 / 3.0) + bow;
+    [
+        edge_toward(from, first),
+        first,
+        second,
+        edge_toward(to, second),
+    ]
+}
+
+/// Where the line from the centre of `rect` towards `target` leaves the rectangle (or
+/// `target` itself if it is inside).
+fn edge_toward(rect: Rect, target: Pos2) -> Pos2 {
+    let center = rect.center();
+    let direction = target - center;
+    let half = rect.size() * 0.5;
+    let reach = |half: f32, along: f32| {
+        if along.abs() > f32::EPSILON {
+            half / along.abs()
+        } else {
+            f32::INFINITY
+        }
+    };
+    let scale = reach(half.x, direction.x)
+        .min(reach(half.y, direction.y))
+        .min(1.0);
+    center + direction * scale
+}
+
+/// The triangle at the end of a cross-link `curve`: its tip on the curve's end, pointing
+/// the way the curve arrives, `size` long.
+pub(crate) fn arrow_head(curve: [Pos2; 4], size: f32) -> [Pos2; 3] {
+    let tip = curve[3];
+    let arriving = [curve[2], curve[1], curve[0]]
+        .into_iter()
+        .map(|point| tip - point)
+        .find(|direction| direction.length() > f32::EPSILON)
+        .map_or(Vec2::X, Vec2::normalized);
+    let half_width = arriving.rot90() * size * 0.5;
+    let base = tip - arriving * size;
+    [tip, base + half_width, base - half_width]
+}
+
+/// Draw one cross-link: a dashed `curve` (in screen pixels) with an arrowhead.
+fn paint_cross_link(painter: &Painter, curve: [Pos2; 4], stroke: Stroke, zoom: f32) {
+    let points = CubicBezierShape::from_points_stroke(curve, false, Color32::TRANSPARENT, stroke)
+        .flatten(Some(0.5));
+    painter.extend(Shape::dashed_line(
+        &points,
+        stroke,
+        LINK_DASH[0] * zoom,
+        LINK_DASH[1] * zoom,
+    ));
+    painter.add(Shape::convex_polygon(
+        arrow_head(curve, ARROW_SIZE * zoom).to_vec(),
+        stroke.color,
+        Stroke::NONE,
+    ));
 }
 
 /// Draw a collapse/expand handle: a filled "+" disc when collapsed, an outlined "-"
@@ -465,7 +598,6 @@ fn world_bounds(map: &MindMap, start: NodeId) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Point;
     use eframe::egui;
 
     /// Run one headless egui frame of `size` pixels and hand `draw` its painter.
@@ -563,6 +695,32 @@ mod tests {
         assert!(view.node_rect(b).is_some());
         assert_eq!(accent_of(&view, b1), usual);
         assert!(usual.is_some());
+    }
+
+    #[test]
+    fn cross_link_curves_run_edge_to_edge_and_end_in_an_arrow() {
+        let from = Rect::from_center_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 40.0));
+        let to = Rect::from_center_size(Pos2::new(300.0, 0.0), Vec2::new(60.0, 40.0));
+
+        let curve = cross_link_curve(from, to);
+
+        // Both ends sit on the boxes' outlines, not inside them.
+        let on_outline = |rect: Rect, point: Pos2| {
+            rect.expand(0.01).contains(point) && !rect.shrink(0.01).contains(point)
+        };
+        assert!(on_outline(from, curve[0]), "{:?}", curve[0]);
+        assert!(on_outline(to, curve[3]), "{:?}", curve[3]);
+        // It bows to one side of the straight line between them.
+        assert!(curve[1].y.abs() > 10.0 && (curve[1].y > 0.0) == (curve[2].y > 0.0));
+        let head = arrow_head(curve, 9.0);
+        assert_eq!(head[0], curve[3]);
+        assert!((head[1].distance(head[2]) - 9.0).abs() < 1e-3);
+        // Boxes in the same place give a dot, not NaNs.
+        assert!(
+            cross_link_curve(from, from)
+                .iter()
+                .all(|point| point.is_finite())
+        );
     }
 
     #[test]

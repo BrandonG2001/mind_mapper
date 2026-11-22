@@ -29,6 +29,7 @@ mod canvas;
 mod editing;
 mod files;
 mod focus;
+mod links;
 mod panels;
 mod questions;
 mod selection;
@@ -42,6 +43,8 @@ const AUTOSAVE_SECONDS: f64 = 20.0;
 const MIN_EDITOR_WIDTH: f32 = 140.0;
 /// Space above and below the text inside the label editor, at 100% zoom.
 const EDITOR_PADDING: f32 = 8.0;
+/// Longest node label quoted in status messages and menus, in characters.
+const MAX_QUOTED_LABEL: usize = 40;
 /// Number of undo steps kept.
 const HISTORY_LIMITS: HistoryLimits = HistoryLimits {
     max_steps: 200,
@@ -85,8 +88,10 @@ enum Action {
     Find,
     FindNext,
     FindPrevious,
-    /// Esc: close the find bar, or else leave focus mode.
+    /// Esc: cancel linking, or close the find bar, or else leave focus mode.
     Dismiss,
+    /// Start a cross-link from the selected node to the next node clicked.
+    StartLink,
     ToggleDetails,
     /// Show only the selected branch, or the whole map again.
     ToggleFocus,
@@ -102,7 +107,7 @@ enum ClipboardRequest {
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 27] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 28] = [
     // Before the plain arrows, which also match while Alt is held.
     (
         KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp),
@@ -193,6 +198,10 @@ const SHORTCUTS: [(KeyboardShortcut, Action); 27] = [
         Action::ToggleFocus,
     ),
     (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::K),
+        Action::StartLink,
+    ),
+    (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::E),
         Action::Export,
     ),
@@ -280,6 +289,8 @@ pub struct MindMapApp {
     updates: updates::Updates,
     /// Where the user's own templates are kept; `None` if there is no data folder.
     template_folder: Option<TemplateFolder>,
+    /// The node a cross-link is being drawn from, until the target is clicked.
+    linking: Option<NodeId>,
     /// A question shown over the window, waiting for the user's answer.
     question: Option<Question>,
     /// The map changed since the last recovery copy was written.
@@ -397,6 +408,7 @@ impl MindMapApp {
             recovered: None,
             deferred_open: None,
             question: None,
+            linking: None,
             template_folder: None,
             updates: updates::Updates::default(),
             also_selected: HashSet::new(),
@@ -511,10 +523,11 @@ impl MindMapApp {
             Action::FindNext => self.search_command(SearchCommand::Next),
             Action::FindPrevious => self.search_command(SearchCommand::Previous),
             Action::Dismiss => {
-                if self.search.take().is_none() {
+                if !self.cancel_link() && self.search.take().is_none() {
                     self.leave_focus();
                 }
             }
+            Action::StartLink => self.start_link(),
             Action::ToggleFocus => self.toggle_focus(),
             Action::ToggleDetails => {
                 if self.details.take().is_none() {
@@ -613,6 +626,16 @@ impl MindMapApp {
             Some(ClipboardRequest::Paste(text)) => self.paste_outline(&text),
             None => {}
         }
+    }
+}
+
+/// A node's label for status messages and menus: its first line, shortened if long.
+fn node_label(map: &MindMap, id: NodeId) -> String {
+    let text = map.node(id).map_or("", Node::text);
+    let first_line = text.lines().next().unwrap_or_default();
+    match first_line.char_indices().nth(MAX_QUOTED_LABEL) {
+        Some((cut, _)) => format!("{}...", &first_line[..cut]),
+        None => first_line.to_owned(),
     }
 }
 

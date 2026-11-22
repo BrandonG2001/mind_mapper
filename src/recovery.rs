@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{MindMap, NodeRecord};
+use crate::model::{LinkRecord, MapRecords, MindMap, NodeRecord};
 use crate::storage::{FORMAT_VERSION, StorageError, write_atomically};
 
 /// Recovery file written by versions before per-window recovery.
@@ -33,6 +33,9 @@ struct RecoveryFile<P> {
     /// The file the map was opened from or last saved to, if any.
     source: Option<P>,
     nodes: Vec<NodeRecord>,
+    /// Cross-links; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<LinkRecord>,
 }
 
 /// The files of an orphaned recovery copy. Holding this keeps the orphan's lock, so no
@@ -106,10 +109,12 @@ impl RecoveryWriter {
     ///
     /// Returns `StorageError::Io` or `StorageError::Json` if the file cannot be written.
     pub fn save(&self, map: &MindMap, source: Option<&Path>) -> Result<(), StorageError> {
+        let MapRecords { nodes, links } = map.to_map_records();
         let file = RecoveryFile {
             version: FORMAT_VERSION,
             source,
-            nodes: map.to_records(),
+            nodes,
+            links,
         };
         write_atomically(&self.path, |writer| {
             serde_json::to_writer(writer, &file)?;
@@ -331,7 +336,10 @@ fn read_recovery(path: &Path) -> Result<Option<Recovered>, StorageError> {
         return Err(StorageError::UnsupportedVersion(file.version));
     }
     Ok(Some(Recovered {
-        map: MindMap::from_records(file.nodes)?,
+        map: MindMap::from_map_records(MapRecords {
+            nodes: file.nodes,
+            links: file.links,
+        })?,
         source: file.source,
         files: None,
     }))

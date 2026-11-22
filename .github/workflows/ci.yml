@@ -18,7 +18,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-24.04-arm is real ARM64 hardware, so the tests run there natively.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,26 +38,17 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-
-  linux-arm64:
-    name: Build (Linux ARM64, cross-compiled)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-unknown-linux-gnu
-      - name: Install ARM64 linker
+      # Start the release build on a virtual screen (software OpenGL) and check it is
+      # still running after 15 seconds instead of crashing at startup.
+      - name: Smoke test the release build
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          sudo apt-get install -y xvfb libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
+          cargo build --release --locked
+          status=0
+          timeout 15 xvfb-run -a target/release/mind_mapper || status=$?
+          echo "exit status: $status (124 = still running when stopped)"
+          test "$status" -eq 124
 
   licenses:
     name: Third-party licenses

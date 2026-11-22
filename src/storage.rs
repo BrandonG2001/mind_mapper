@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::model::{MapError, MindMap, NodeRecord};
+use crate::model::{LinkRecord, MapError, MapRecords, MindMap, NodeRecord};
 
 /// File format version written by this build.
 pub(crate) const FORMAT_VERSION: u32 = 1;
@@ -34,11 +34,15 @@ pub enum StorageError {
     InvalidMap(#[from] MapError),
 }
 
-/// On-disk layout: a format version plus the nodes in pre-order.
+/// On-disk layout: a format version, the nodes in pre-order and any cross-links.
 #[derive(Serialize, Deserialize)]
 struct MapFile {
     version: u32,
     nodes: Vec<NodeRecord>,
+    /// Omitted when empty, so maps without links are written exactly as before and files
+    /// from older versions (which have none) still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<LinkRecord>,
 }
 
 /// Write `map` as pretty-printed JSON.
@@ -47,9 +51,11 @@ struct MapFile {
 ///
 /// Returns `StorageError::Json` or `StorageError::Io` if writing fails.
 pub fn write_map<W: Write>(map: &MindMap, writer: W) -> Result<(), StorageError> {
+    let MapRecords { nodes, links } = map.to_map_records();
     let file = MapFile {
         version: FORMAT_VERSION,
-        nodes: map.to_records(),
+        nodes,
+        links,
     };
     serde_json::to_writer_pretty(writer, &file)?;
     Ok(())
@@ -67,7 +73,10 @@ pub fn read_map<R: Read>(reader: R) -> Result<MindMap, StorageError> {
     if file.version != FORMAT_VERSION {
         return Err(StorageError::UnsupportedVersion(file.version));
     }
-    Ok(MindMap::from_records(file.nodes)?)
+    Ok(MindMap::from_map_records(MapRecords {
+        nodes: file.nodes,
+        links: file.links,
+    })?)
 }
 
 /// A fingerprint of a file's exact contents, used to notice when another window or
@@ -235,6 +244,27 @@ mod tests {
 
         assert_ne!(changed, saved);
         assert_eq!(current_stamp(&path).expect("readable"), Some(changed));
+    }
+
+    #[test]
+    fn links_are_saved_only_when_there_are_some() {
+        let dir = TempDir::new("links");
+        let path = dir.path().join("map.json");
+        let mut map = MindMap::new("root");
+        let a = map.add_child(map.root(), "a").expect("root");
+        let b = map.add_child(map.root(), "b").expect("root");
+
+        save_to_path(&map, &path).expect("save succeeds");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("readable")
+                .contains("links")
+        );
+
+        map.add_cross_link(a, b).expect("valid");
+        save_to_path(&map, &path).expect("save succeeds");
+        let (loaded, _) = load_from_path(&path).expect("loads");
+        assert_eq!(loaded.to_map_records(), map.to_map_records());
     }
 
     #[test]

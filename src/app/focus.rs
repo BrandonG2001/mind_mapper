@@ -1,8 +1,8 @@
 //! Focus mode: one branch shown on its own (F6, the toolbar or the right-click menu), with
 //! the rest of the map hidden until Esc or F6.
 
-use super::MindMapApp;
-use crate::model::{Node, NodeId};
+use super::{MindMapApp, node_label};
+use crate::model::NodeId;
 
 impl MindMapApp {
     /// Show only the selected branch, or the whole map again if focus mode is on.
@@ -33,10 +33,9 @@ impl MindMapApp {
         {
             self.select(Some(id));
         }
-        let label = self.map.node(id).map_or("", Node::text);
         self.status = format!(
             "Focus: showing \"{}\" only; Esc or F6 shows the whole map",
-            label.lines().next().unwrap_or_default()
+            node_label(&self.map, id)
         );
     }
 

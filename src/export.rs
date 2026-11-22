@@ -12,17 +12,21 @@ use std::sync::Arc;
 use eframe::egui::{Color32, Pos2, Rect, Vec2, Visuals};
 use krilla::Document;
 use krilla::color::rgb;
-use krilla::geom::{PathBuilder, Point as KrillaPoint, Transform};
+use krilla::geom::{Path as PdfPath, PathBuilder, Point as KrillaPoint, Transform};
+use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
-use krilla::paint::{Fill, Stroke};
+use krilla::paint::{Fill, Stroke, StrokeDash};
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
 use crate::clipboard;
 use crate::formats::{Format, freemind, opml, push_escaped};
-use crate::map_view::{Accents, BASE_FONT_SIZE, LINE_HEIGHT, estimated_rect, wrap_label};
-use crate::model::MindMap;
+use crate::map_view::{
+    ARROW_SIZE, Accents, BASE_FONT_SIZE, LINE_HEIGHT, LINK_DASH, LINK_OPACITY, LINK_WIDTH,
+    arrow_head, cross_link_curve, estimated_rect, wrap_label,
+};
+use crate::model::{MindMap, NodeId};
 use crate::storage::{StorageError, write_atomically};
 use crate::theme::ColorTheme;
 
@@ -152,7 +156,9 @@ struct Scene<'a> {
     size: Vec2,
     /// Curves from each parent to each child, drawn first so node boxes cover their ends.
     edges: Vec<SceneEdge>,
-    /// Node boxes with their labels, drawn over the edges.
+    /// Cross-links whose ends are both shown, drawn over the edges as dashed arrows.
+    links: Vec<[Pos2; 4]>,
+    /// Node boxes with their labels, drawn over the edges and links.
     nodes: Vec<SceneNode<'a>>,
 }
 
@@ -186,6 +192,8 @@ impl<'a> Scene<'a> {
         accents.reset(map);
         let mut edges = Vec::new();
         let mut nodes = Vec::with_capacity(map.len());
+        // Each shown node's box by slot, to find where cross-links start and end.
+        let mut boxes: Vec<Option<Rect>> = vec![None; map.slot_count()];
         for visit in map.visible_preorder() {
             let accent = accents.resolve(map, &visit, root_color);
             let position = visit.node.position();
@@ -200,6 +208,7 @@ impl<'a> Scene<'a> {
             }
             let world_rect = estimated_rect(visit.node);
             let rect = Rect::from_min_size(at(world_rect.min), world_rect.size());
+            boxes[visit.id.index()] = Some(rect);
             let line_count =
                 f32::from(u16::try_from(wrap_label(visit.node.text()).count()).unwrap_or(u16::MAX));
             // Baseline of the first line: lines are centred as a block, and a baseline
@@ -219,9 +228,16 @@ impl<'a> Scene<'a> {
                 lines,
             });
         }
+        let box_of = |id: NodeId| boxes.get(id.index()).copied().flatten();
+        let links = map
+            .cross_links()
+            .iter()
+            .filter_map(|link| Some(cross_link_curve(box_of(link.from())?, box_of(link.to())?)))
+            .collect();
         Self {
             size: bounds.size(),
             edges,
+            links,
             nodes,
         }
     }
@@ -252,19 +268,27 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
         hex(style.background)
     )?;
     for edge in &scene.edges {
-        let [start, first, second, end] = edge.points;
         writeln!(
             out,
-            r#"<path d="M {:.1} {:.1} C {:.1} {:.1}, {:.1} {:.1}, {:.1} {:.1}" fill="none" stroke="{}" stroke-width="{STROKE_WIDTH}"/>"#,
-            start.x,
-            start.y,
-            first.x,
-            first.y,
-            second.x,
-            second.y,
-            end.x,
-            end.y,
+            r#"<path d="{}" fill="none" stroke="{}" stroke-width="{STROKE_WIDTH}"/>"#,
+            curve_data(edge.points),
             hex(edge.color),
+        )?;
+    }
+    let link_color = hex(style.text);
+    for &curve in &scene.links {
+        writeln!(
+            out,
+            r#"<path d="{}" fill="none" stroke="{link_color}" stroke-opacity="{LINK_OPACITY}" stroke-width="{LINK_WIDTH}" stroke-dasharray="{} {}"/>"#,
+            curve_data(curve),
+            LINK_DASH[0],
+            LINK_DASH[1],
+        )?;
+        let [tip, left, right] = arrow_head(curve, ARROW_SIZE);
+        writeln!(
+            out,
+            r#"<polygon points="{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{link_color}" fill-opacity="{LINK_OPACITY}"/>"#,
+            tip.x, tip.y, left.x, left.y, right.x, right.y,
         )?;
     }
     for node in &scene.nodes {
@@ -293,6 +317,14 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
     }
     out.push_str("</svg>\n");
     Ok(())
+}
+
+/// SVG path data for a cubic curve.
+fn curve_data([start, first, second, end]: [Pos2; 4]) -> String {
+    format!(
+        "M {:.1} {:.1} C {:.1} {:.1}, {:.1} {:.1}, {:.1} {:.1}",
+        start.x, start.y, first.x, first.y, second.x, second.y, end.x, end.y
+    )
 }
 
 /// The visible part of the map as a PDF document of one page, in light colours whatever
@@ -341,11 +373,15 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
         None,
     );
     for edge in &scene.edges {
-        let [start, first, second, end] = edge.points;
-        let mut curve = PathBuilder::new();
-        curve.move_to(start.x, start.y);
-        curve.cubic_to(first.x, first.y, second.x, second.y, end.x, end.y);
-        draw(&mut surface, curve.finish(), None, Some(edge.color));
+        draw(
+            &mut surface,
+            curve_path(edge.points),
+            None,
+            Some(edge.color),
+        );
+    }
+    for &curve in &scene.links {
+        draw_cross_link(&mut surface, curve, style.text);
     }
     for node in &scene.nodes {
         draw(
@@ -404,9 +440,49 @@ fn line_glyphs(face: &ttf_parser::Face<'_>, line: &str) -> Vec<KrillaGlyph> {
         .collect()
 }
 
+/// A cubic curve as a PDF path.
+fn curve_path([start, first, second, end]: [Pos2; 4]) -> Option<PdfPath> {
+    let mut path = PathBuilder::new();
+    path.move_to(start.x, start.y);
+    path.cubic_to(first.x, first.y, second.x, second.y, end.x, end.y);
+    path.finish()
+}
+
+/// Draw a cross-link as a translucent dashed curve with an arrowhead, as on screen.
+fn draw_cross_link(surface: &mut krilla::surface::Surface<'_>, curve: [Pos2; 4], color: Color32) {
+    let opacity = NormalizedF32::new(LINK_OPACITY).unwrap_or(NormalizedF32::ONE);
+    if let Some(path) = curve_path(curve) {
+        surface.set_fill(None);
+        surface.set_stroke(Some(Stroke {
+            width: LINK_WIDTH,
+            opacity,
+            dash: Some(StrokeDash {
+                array: LINK_DASH.to_vec(),
+                offset: 0.0,
+            }),
+            ..pdf_stroke(color)
+        }));
+        surface.draw_path(&path);
+    }
+    let [tip, left, right] = arrow_head(curve, ARROW_SIZE);
+    let mut head = PathBuilder::new();
+    head.move_to(tip.x, tip.y);
+    head.line_to(left.x, left.y);
+    head.line_to(right.x, right.y);
+    head.close();
+    if let Some(path) = head.finish() {
+        surface.set_stroke(None);
+        surface.set_fill(Some(Fill {
+            opacity,
+            ..pdf_fill(color)
+        }));
+        surface.draw_path(&path);
+    }
+}
+
 /// A rectangle with corners rounded by `radius`, as a path of lines and quarter-circle
 /// curves.
-fn rounded_rect(rect: Rect, radius: f32) -> Option<krilla::geom::Path> {
+fn rounded_rect(rect: Rect, radius: f32) -> Option<PdfPath> {
     // How far along the tangent a cubic curve's control points sit to approximate a
     // quarter circle.
     const KAPPA: f32 = 0.552_284_8;

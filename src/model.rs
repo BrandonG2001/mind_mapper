@@ -205,6 +205,22 @@ pub enum MapError {
     /// A node cannot be moved underneath itself or one of its own descendants.
     #[error("a node cannot be moved into its own branch")]
     WouldCreateCycle,
+    /// A cross-link must join two different nodes.
+    #[error("a node cannot be linked to itself")]
+    LinkToSelf,
+    /// The two nodes are already linked (in either direction).
+    #[error("these nodes are already linked")]
+    DuplicateLink,
+    /// There is no such cross-link to remove.
+    #[error("these nodes are not linked")]
+    LinkNotFound,
+    /// A link record points at a node that is not in the list, at itself, or repeats
+    /// another link.
+    #[error("link {index} is invalid: it must join two different, existing nodes once")]
+    InvalidLink {
+        /// Position of the offending link record.
+        index: usize,
+    },
     /// Two nodes that were expected to share a parent do not.
     #[error("only nodes with the same parent can swap places")]
     NotSiblings,
@@ -239,6 +255,58 @@ pub struct NodeRecord {
     pub link: Option<String>,
 }
 
+/// Flat, serializable form of a cross-link: indices into the node records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LinkRecord {
+    /// Index of the node record the link starts at.
+    pub from: usize,
+    /// Index of the node record the link points to.
+    pub to: usize,
+}
+
+/// A whole map in flat form: nodes in pre-order, plus cross-links between them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MapRecords {
+    /// The nodes, parents before children.
+    pub nodes: Vec<NodeRecord>,
+    /// The cross-links, by node record index.
+    pub links: Vec<LinkRecord>,
+}
+
+/// A relationship line between two nodes anywhere in the map, drawn as a dashed arrow
+/// from `from` to `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CrossLink {
+    from: NodeId,
+    to: NodeId,
+}
+
+impl CrossLink {
+    /// The node the arrow starts at.
+    #[must_use]
+    pub const fn from(self) -> NodeId {
+        self.from
+    }
+
+    /// The node the arrow points to.
+    #[must_use]
+    pub const fn to(self) -> NodeId {
+        self.to
+    }
+
+    /// Whether the link joins `a` and `b`, in either direction.
+    #[must_use]
+    pub fn joins(self, a: NodeId, b: NodeId) -> bool {
+        (self.from, self.to) == (a, b) || (self.from, self.to) == (b, a)
+    }
+
+    /// Whether the link starts or ends at `id`.
+    #[must_use]
+    pub fn touches(self, id: NodeId) -> bool {
+        self.from == id || self.to == id
+    }
+}
+
 /// `serde` helper: skip writing a `false` flag.
 // serde passes the field by reference, so this cannot take `bool` by value.
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -250,7 +318,8 @@ impl HeapSize for MindMap {
     /// Slot table plus every node's text, notes, link and child list.
     fn heap_size(&self) -> usize {
         let slots = self.slots.capacity() * std::mem::size_of::<Option<Node>>()
-            + self.free.capacity() * std::mem::size_of::<usize>();
+            + self.free.capacity() * std::mem::size_of::<usize>()
+            + self.links.capacity() * std::mem::size_of::<CrossLink>();
         let nodes: usize = self
             .iter()
             .map(|(_, node)| {
@@ -282,6 +351,8 @@ pub struct MindMap {
     slots: Vec<Option<Node>>,
     free: Vec<usize>,
     root: NodeId,
+    /// Relationship lines between nodes; both ends always exist.
+    links: Vec<CrossLink>,
 }
 
 impl MindMap {
@@ -297,6 +368,7 @@ impl MindMap {
             slots: vec![Some(root)],
             free: Vec::new(),
             root: NodeId(0),
+            links: Vec::new(),
         }
     }
 
@@ -741,6 +813,48 @@ impl MindMap {
         Ok(())
     }
 
+    /// The relationship lines between nodes, in the order they were added.
+    #[must_use]
+    pub fn cross_links(&self) -> &[CrossLink] {
+        &self.links
+    }
+
+    /// Add a relationship line from `from` to `to`.
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::NodeNotFound` if either node does not exist
+    /// * `MapError::LinkToSelf` if they are the same node
+    /// * `MapError::DuplicateLink` if they are already linked, in either direction
+    pub fn add_cross_link(&mut self, from: NodeId, to: NodeId) -> Result<(), MapError> {
+        self.node(from).ok_or(MapError::NodeNotFound(from))?;
+        self.node(to).ok_or(MapError::NodeNotFound(to))?;
+        if from == to {
+            return Err(MapError::LinkToSelf);
+        }
+        if self.links.iter().any(|link| link.joins(from, to)) {
+            return Err(MapError::DuplicateLink);
+        }
+        self.links.push(CrossLink { from, to });
+        Ok(())
+    }
+
+    /// Remove the relationship line between `a` and `b`, whichever way it points.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::LinkNotFound` if they are not linked.
+    pub fn remove_cross_link(&mut self, a: NodeId, b: NodeId) -> Result<(), MapError> {
+        let index = self
+            .links
+            .iter()
+            .position(|link| link.joins(a, b))
+            .ok_or(MapError::LinkNotFound)?;
+        // `remove` (not `swap_remove`) keeps the remaining links in order.
+        self.links.remove(index);
+        Ok(())
+    }
+
     /// Delete a node together with all of its descendants.
     ///
     /// # Returns
@@ -769,12 +883,22 @@ impl MindMap {
                 removed += 1;
             }
         }
+        // Links to or from removed nodes go with them.
+        let slots = &self.slots;
+        let live = |id: NodeId| slots.get(id.0).is_some_and(Option::is_some);
+        self.links.retain(|link| live(link.from) && live(link.to));
         Ok(removed)
     }
 
-    /// Flatten the map into pre-order records for saving.
+    /// Flatten the map's nodes into pre-order records (without cross-links).
     #[must_use]
     pub fn to_records(&self) -> Vec<NodeRecord> {
+        self.to_map_records().nodes
+    }
+
+    /// Flatten the whole map, nodes and cross-links, into records for saving.
+    #[must_use]
+    pub fn to_map_records(&self) -> MapRecords {
         let mut index_of = vec![usize::MAX; self.slots.len()];
         let mut records = Vec::with_capacity(self.len());
         for visit in self.preorder() {
@@ -789,17 +913,47 @@ impl MindMap {
                 link: visit.node.link.clone(),
             });
         }
-        records
+        let links = self
+            .links
+            .iter()
+            .map(|link| LinkRecord {
+                from: index_of[link.from.0],
+                to: index_of[link.to.0],
+            })
+            .collect();
+        MapRecords {
+            nodes: records,
+            links,
+        }
     }
 
-    /// Rebuild a map from records produced by [`MindMap::to_records`].
+    /// Rebuild a map without cross-links from node records (see
+    /// [`MindMap::from_map_records`]).
     ///
     /// # Errors
     ///
-    /// * `MapError::Empty` if `records` is empty
+    /// As [`MindMap::from_map_records`].
+    pub fn from_records(records: Vec<NodeRecord>) -> Result<Self, MapError> {
+        Self::from_map_records(MapRecords {
+            nodes: records,
+            links: Vec::new(),
+        })
+    }
+
+    /// Rebuild a map from records produced by [`MindMap::to_map_records`].
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::Empty` if there are no node records
     /// * `MapError::InvalidRoot` if the first record has a parent or a later one has none
     /// * `MapError::InvalidParent` if a record's parent does not appear before it
-    pub fn from_records(records: Vec<NodeRecord>) -> Result<Self, MapError> {
+    /// * `MapError::InvalidLink` if a link record names a missing node, links a node to
+    ///   itself, or repeats a link
+    pub fn from_map_records(records: MapRecords) -> Result<Self, MapError> {
+        let MapRecords {
+            nodes: records,
+            links,
+        } = records;
         if records.is_empty() {
             return Err(MapError::Empty);
         }
@@ -828,11 +982,18 @@ impl MindMap {
                 ..Node::new(record.text, record.position, parent)
             }));
         }
-        Ok(Self {
+        let mut map = Self {
             slots,
             free: Vec::new(),
             root: NodeId(0),
-        })
+            links: Vec::with_capacity(links.len()),
+        };
+        for (index, link) in links.into_iter().enumerate() {
+            // Record indices are slot indices here: the map was just built in that order.
+            map.add_cross_link(NodeId(link.from), NodeId(link.to))
+                .map_err(|_| MapError::InvalidLink { index })?;
+        }
+        Ok(map)
     }
 }
 
@@ -1064,6 +1225,66 @@ mod tests {
         assert_eq!(map.swap_siblings(a, a), Err(MapError::NotSiblings));
         assert_eq!(map.swap_siblings(map.root(), b), Err(MapError::RootNode));
         assert_eq!(map, before);
+    }
+
+    #[test]
+    fn cross_links_join_two_different_nodes_once() {
+        let (mut map, a, b, a1) = sample_map();
+
+        map.add_cross_link(a1, b).expect("valid");
+        assert_eq!(map.add_cross_link(b, a1), Err(MapError::DuplicateLink));
+        assert_eq!(map.add_cross_link(a, a), Err(MapError::LinkToSelf));
+        assert_eq!(
+            map.add_cross_link(a, NodeId(99)),
+            Err(MapError::NodeNotFound(NodeId(99)))
+        );
+        let link = map.cross_links()[0];
+        assert_eq!((link.from(), link.to()), (a1, b));
+        assert!(link.touches(b) && !link.touches(a));
+
+        // Either direction names the same link.
+        map.remove_cross_link(b, a1).expect("linked");
+        assert_eq!(map.remove_cross_link(a1, b), Err(MapError::LinkNotFound));
+    }
+
+    #[test]
+    fn deleting_a_branch_removes_its_links() {
+        let (mut map, a, b, a1) = sample_map();
+        map.add_cross_link(a1, b).expect("valid");
+        map.add_cross_link(a, b).expect("valid");
+
+        map.remove_subtree(a).expect("a exists");
+
+        assert_eq!(map.cross_links(), &[]);
+        // A new node reusing a removed slot is not linked by accident.
+        let reused = map.add_child(b, "new").expect("b exists");
+        assert!(reused == a || reused == a1, "slot is reused");
+        assert_eq!(map.cross_links(), &[]);
+    }
+
+    #[test]
+    fn links_survive_records_and_bad_ones_are_rejected() {
+        let (mut map, _, b, a1) = sample_map();
+        map.add_cross_link(a1, b).expect("valid");
+
+        let records = map.to_map_records();
+        let rebuilt = MindMap::from_map_records(records.clone()).expect("valid");
+
+        assert_eq!(rebuilt.to_map_records(), records);
+        assert_eq!(rebuilt.cross_links().len(), 1);
+        for (from, to) in [
+            (0, 0),
+            (0, 99),
+            (records.links[0].to, records.links[0].from),
+        ] {
+            let mut bad = records.clone();
+            bad.links.push(LinkRecord { from, to });
+            assert_eq!(
+                MindMap::from_map_records(bad),
+                Err(MapError::InvalidLink { index: 1 }),
+                "{from} -> {to}"
+            );
+        }
     }
 
     #[test]

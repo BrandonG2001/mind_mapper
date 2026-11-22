@@ -30,9 +30,11 @@ keyboard, drag branches around and save your maps as plain JSON files.
 - **Export** to a PNG image, an SVG drawing, a PDF document (light colours, for
   printing, with selectable text), a Markdown outline, an OPML outline or a FreeMind map.
 - **Import** OPML outlines (from most outliners) and FreeMind / Freeplane `.mm` maps:
-  labels, notes, links, colours, folded branches and sides come across, then the map is
-  tidied.
+  labels, notes, links, colours, folded branches, sides and arrow links come across, then
+  the map is tidied.
 - **Focus mode**: F6 shows only the selected branch; Esc or F6 brings back the whole map.
+- **Cross-links**: dashed arrows between any two nodes, across branches (Ctrl+K or "Link
+  to..." in the right-click menu, then click the other node). They appear in exports too.
 - **Find** any node by its text or notes; matches are highlighted and folded branches open
   as needed.
 - **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
@@ -112,6 +114,8 @@ mind_mapper path/to/ideas.json
 | Collapse or expand a branch | Click the round handle beside the node (**+** on folded nodes, **-** on the selected node) |
 | Colour, notes, rename, reorder, focus on or delete a node | Right-click it (colour and delete apply to every selected node) |
 | Remove one of your templates | Right-click its card on the start screen |
+| Link two nodes | Right-click the first, choose **Link to...**, then click the second (Esc cancels) |
+| Remove a link | Right-click either node and choose **Remove link to/from ...** |
 | Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
@@ -132,7 +136,7 @@ mind_mapper path/to/ideas.json
 | Alt+Up / Alt+Down | Swap the selected node (with its branch) with the sibling above / below it |
 | Ctrl+E | Export as PNG, SVG, PDF, Markdown, OPML or FreeMind (chosen by the file extension) |
 | Ctrl+F | Find; Enter / Shift+Enter (or F3 / Shift+F3) go to the next / previous match, Esc closes |
-| Esc | Close the find bar, or leave focus mode |
+| Esc | Cancel a link being made, close the find bar, or leave focus mode |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
 | Ctrl+C / Ctrl+X | Copy / cut the selected branches (or copy the whole map) as an indented outline |
 | Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
@@ -140,6 +144,7 @@ mind_mapper path/to/ideas.json
 | Ctrl+N | New map (opens the template gallery) |
 | Ctrl+O | Open a map, or import an OPML (`.opml`) or FreeMind (`.mm`) file |
 | F6 | Focus mode: show only the selected branch, or the whole map again |
+| Ctrl+K | Link the selected node to the next node you click |
 | Ctrl+S / Ctrl+Shift+S | Save / save as |
 
 While renaming, Enter keeps the new label, Shift+Enter starts a new line and Esc cancels.
@@ -147,7 +152,8 @@ On the template gallery, Esc returns to the map you were editing.
 
 An imported OPML or FreeMind file opens as a new, unsaved map: Save asks where to keep it as
 a mind-map file, so the original is never overwritten. OPML has no colours, folded state or
-sides, so those come from FreeMind files only; neither format keeps node positions.
+sides, so those (and cross-links, FreeMind's arrow links) come from FreeMind files only;
+neither format keeps node positions.
 
 The window title shows `*` when there are unsaved changes. You are asked before unsaved
 work is discarded by opening another map, choosing a template or closing the window. If
@@ -184,7 +190,8 @@ parent by its position in the list:
 
 Optional fields appear only when used, so files from older versions load unchanged:
 `"collapsed": true` on a folded node, `"color": "#rrggbb"` for a chosen colour, `"note"`
-for notes and `"link"` for a web address.
+for notes and `"link"` for a web address. Cross-links are listed after the nodes, by node
+position, as `"links": [{ "from": 6, "to": 1 }]`; versions before 0.9 ignore them.
 
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
@@ -218,9 +225,10 @@ also fail if any widget lacks an accessible name for screen readers.
 The tests never use the network. One test checks the update check against the real GitHub
 API and only runs when asked for: `cargo test -- --ignored live_github`.
 
-GitHub Actions runs formatting, clippy and the tests on Windows and Linux for every push
-and pull request, cross-compiles the Linux ARM64 build, and checks that every dependency's
-license is one accepted in [`about.toml`](about.toml). Pushing a tag such as `v0.2.0`
+GitHub Actions runs formatting, clippy and the tests on Windows, Linux x86-64 and Linux
+ARM64 (on real ARM hardware) for every push and pull request, starts the Linux release
+builds on a virtual screen to check they run, and checks that every dependency's license
+is one accepted in [`about.toml`](about.toml). Pushing a tag such as `v0.2.0`
 builds the portable archives and publishes them as a GitHub Release:
 
 ```sh
@@ -269,6 +277,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
 | [`src/app/files.rs`](src/app/files.rs) | Open and import, save (with the overwrite check), export, templates, settings |
 | [`src/app/focus.rs`](src/app/focus.rs) | Focus mode: one branch on its own |
+| [`src/app/links.rs`](src/app/links.rs) | Making and removing cross-links |
 | [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
 | [`src/app/selection.rs`](src/app/selection.rs) | Multi-select, and the edits that act on every selected node |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |
