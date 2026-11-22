@@ -1,0 +1,607 @@
+//! Core mind-map data model: a tree of text nodes with 2D positions.
+//!
+//! Nodes live in a slab (`Vec<Option<Node>>`) so lookups by [`NodeId`] are O(1) array
+//! indexing, and the iteration order is deterministic, which keeps drawing and hit
+//! testing stable from frame to frame. Freed slots are reused through a free list.
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Horizontal distance between a parent and a newly created child.
+const CHILD_OFFSET_X: f32 = 220.0;
+/// Vertical distance between consecutive siblings that are created automatically.
+const SIBLING_OFFSET_Y: f32 = 70.0;
+
+/// Handle that identifies one node inside a [`MindMap`].
+///
+/// This is a "newtype" wrapper: it is a `usize` at runtime, but the compiler will not let
+/// you mix it up with any other integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(usize);
+
+/// A 2D point in world (map) coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Point {
+    /// Horizontal coordinate; grows to the right.
+    pub x: f32,
+    /// Vertical coordinate; grows downwards.
+    pub y: f32,
+}
+
+impl Point {
+    /// Create a point from its coordinates.
+    #[must_use]
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// One idea in the mind map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    text: String,
+    position: Point,
+    parent: Option<NodeId>,
+    children: Vec<NodeId>,
+}
+
+impl Node {
+    /// The node's label.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Centre of the node in world coordinates.
+    #[must_use]
+    pub const fn position(&self) -> Point {
+        self.position
+    }
+
+    /// The parent node, or `None` for the root.
+    #[must_use]
+    pub const fn parent(&self) -> Option<NodeId> {
+        self.parent
+    }
+
+    /// Child nodes in creation order.
+    #[must_use]
+    pub fn children(&self) -> &[NodeId] {
+        &self.children
+    }
+}
+
+/// Errors produced by operations on a [`MindMap`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MapError {
+    /// The given id does not refer to a live node.
+    #[error("node {0:?} does not exist")]
+    NodeNotFound(NodeId),
+    /// The root node cannot be deleted and has no siblings.
+    #[error("the operation is not allowed on the root node")]
+    RootNode,
+    /// A list of records was empty.
+    #[error("a mind map must contain at least one node")]
+    Empty,
+    /// The first record must be the root, which has no parent.
+    #[error("the first node must be the root and must not have a parent")]
+    InvalidRoot,
+    /// A record pointed at a parent that does not come before it.
+    #[error("node {index} refers to parent {parent}, which must appear earlier in the list")]
+    InvalidParent {
+        /// Position of the offending record.
+        index: usize,
+        /// The parent index it pointed to.
+        parent: usize,
+    },
+}
+
+/// Flat, serializable form of a single node.
+///
+/// A whole map is a list of records in pre-order (every parent comes before its children),
+/// and `parent` is the index of the parent record. That ordering rule makes cycles
+/// impossible, so a file can be validated in one pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeRecord {
+    /// Index of the parent record, or `None` for the root.
+    pub parent: Option<usize>,
+    /// Node label.
+    pub text: String,
+    /// Node centre in world coordinates.
+    pub position: Point,
+}
+
+/// A node visited by [`MindMap::preorder`].
+#[derive(Debug, Clone, Copy)]
+pub struct Visit<'a> {
+    /// The visited node's id.
+    pub id: NodeId,
+    /// The visited node.
+    pub node: &'a Node,
+    /// Index of the root's child this node descends from (`None` for the root itself).
+    /// The UI uses it to give every top-level branch its own colour.
+    pub branch: Option<usize>,
+}
+
+/// A tree of ideas with a single root.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MindMap {
+    slots: Vec<Option<Node>>,
+    free: Vec<usize>,
+    root: NodeId,
+}
+
+impl MindMap {
+    /// Create a map that contains only a root node at the origin.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_text` - Label of the central idea
+    #[must_use]
+    pub fn new(root_text: &str) -> Self {
+        let root = Node {
+            text: root_text.to_owned(),
+            position: Point::default(),
+            parent: None,
+            children: Vec::new(),
+        };
+        Self {
+            slots: vec![Some(root)],
+            free: Vec::new(),
+            root: NodeId(0),
+        }
+    }
+
+    /// The root node's id.
+    #[must_use]
+    pub const fn root(&self) -> NodeId {
+        self.root
+    }
+
+    /// Number of live nodes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len() - self.free.len()
+    }
+
+    /// Always `false`: a map always has its root node. Provided because clippy expects
+    /// every type with a `len` method to also have `is_empty`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Look up a node.
+    ///
+    /// # Returns
+    ///
+    /// The node, or `None` if `id` was deleted or never existed.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        // `?` on an Option returns None early, much like a guard clause in Python.
+        self.slots.get(id.0)?.as_ref()
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Result<&mut Node, MapError> {
+        self.slots
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .ok_or(MapError::NodeNotFound(id))
+    }
+
+    /// Iterate over all live nodes in slot order (deterministic, but not tree order).
+    pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|node| (NodeId(index), node)))
+    }
+
+    /// Walk the tree depth-first, visiting parents before their children.
+    ///
+    /// # Returns
+    ///
+    /// An iterator over [`Visit`]s, starting with the root.
+    pub fn preorder(&self) -> impl Iterator<Item = Visit<'_>> {
+        // An explicit stack instead of recursion, so deep trees cannot overflow the
+        // call stack.
+        let mut stack = vec![(self.root, None)];
+        std::iter::from_fn(move || {
+            let (id, branch) = stack.pop()?;
+            let node = self.node(id)?;
+            // Push in reverse so the first child is popped (visited) first.
+            stack.extend(
+                node.children
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(index, &child)| (child, branch.or(Some(index)))),
+            );
+            Some(Visit { id, node, branch })
+        })
+    }
+
+    /// Add a new child under `parent`, placed next to its existing children.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - Node that will own the new child
+    /// * `text` - Label of the new node
+    ///
+    /// # Returns
+    ///
+    /// The id of the new node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `parent` does not exist.
+    pub fn add_child(&mut self, parent: NodeId, text: &str) -> Result<NodeId, MapError> {
+        let position = self.next_child_position(parent)?;
+        let node = Node {
+            text: text.to_owned(),
+            position,
+            parent: Some(parent),
+            children: Vec::new(),
+        };
+        let id = if let Some(index) = self.free.pop() {
+            self.slots[index] = Some(node);
+            NodeId(index)
+        } else {
+            self.slots.push(Some(node));
+            NodeId(self.slots.len() - 1)
+        };
+        self.node_mut(parent)?.children.push(id);
+        Ok(id)
+    }
+
+    /// Add a new node directly after `sibling`, under the same parent.
+    ///
+    /// # Arguments
+    ///
+    /// * `sibling` - Existing node whose parent receives the new node
+    /// * `text` - Label of the new node
+    ///
+    /// # Returns
+    ///
+    /// The id of the new node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `sibling` does not exist and
+    /// `MapError::RootNode` if `sibling` is the root.
+    pub fn add_sibling(&mut self, sibling: NodeId, text: &str) -> Result<NodeId, MapError> {
+        let parent = self
+            .node(sibling)
+            .ok_or(MapError::NodeNotFound(sibling))?
+            .parent
+            .ok_or(MapError::RootNode)?;
+        self.add_child(parent, text)
+    }
+
+    /// Choose where a new child of `parent` should go: one step away from the
+    /// grandparent (to the right for root children), below the last existing child.
+    fn next_child_position(&self, parent: NodeId) -> Result<Point, MapError> {
+        let parent_node = self.node(parent).ok_or(MapError::NodeNotFound(parent))?;
+        if let Some(last) = parent_node.children.last().and_then(|&id| self.node(id)) {
+            return Ok(Point::new(
+                last.position.x,
+                last.position.y + SIBLING_OFFSET_Y,
+            ));
+        }
+        let direction =
+            parent_node
+                .parent
+                .and_then(|id| self.node(id))
+                .map_or(1.0, |grandparent| {
+                    if parent_node.position.x < grandparent.position.x {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                });
+        Ok(Point::new(
+            parent_node.position.x + direction * CHILD_OFFSET_X,
+            parent_node.position.y,
+        ))
+    }
+
+    /// Replace a node's label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_text(&mut self, id: NodeId, text: &str) -> Result<(), MapError> {
+        let node = self.node_mut(id)?;
+        // Reuses the existing String allocation when it is large enough.
+        node.text.clear();
+        node.text.push_str(text);
+        Ok(())
+    }
+
+    /// Move a node and all of its descendants by the same offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Root of the subtree to move
+    /// * `dx`, `dy` - Offset in world units
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn translate_subtree(&mut self, id: NodeId, dx: f32, dy: f32) -> Result<(), MapError> {
+        self.node(id).ok_or(MapError::NodeNotFound(id))?;
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            let node = self.node_mut(current)?;
+            node.position.x += dx;
+            node.position.y += dy;
+            stack.extend_from_slice(&node.children);
+        }
+        Ok(())
+    }
+
+    /// Delete a node together with all of its descendants.
+    ///
+    /// # Returns
+    ///
+    /// The number of nodes removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist and `MapError::RootNode` if
+    /// `id` is the root.
+    pub fn remove_subtree(&mut self, id: NodeId) -> Result<usize, MapError> {
+        let parent = self
+            .node(id)
+            .ok_or(MapError::NodeNotFound(id))?
+            .parent
+            .ok_or(MapError::RootNode)?;
+        self.node_mut(parent)?.children.retain(|&child| child != id);
+
+        let mut removed = 0;
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            // `take()` moves the node out of its slot and leaves `None` behind.
+            if let Some(node) = self.slots[current.0].take() {
+                stack.extend(node.children);
+                self.free.push(current.0);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Flatten the map into pre-order records for saving.
+    #[must_use]
+    pub fn to_records(&self) -> Vec<NodeRecord> {
+        let mut index_of = vec![usize::MAX; self.slots.len()];
+        let mut records = Vec::with_capacity(self.len());
+        for visit in self.preorder() {
+            index_of[visit.id.0] = records.len();
+            records.push(NodeRecord {
+                parent: visit.node.parent.map(|parent| index_of[parent.0]),
+                text: visit.node.text.clone(),
+                position: visit.node.position,
+            });
+        }
+        records
+    }
+
+    /// Rebuild a map from records produced by [`MindMap::to_records`].
+    ///
+    /// # Errors
+    ///
+    /// * `MapError::Empty` if `records` is empty
+    /// * `MapError::InvalidRoot` if the first record has a parent or a later one has none
+    /// * `MapError::InvalidParent` if a record's parent does not appear before it
+    pub fn from_records(records: Vec<NodeRecord>) -> Result<Self, MapError> {
+        if records.is_empty() {
+            return Err(MapError::Empty);
+        }
+        let mut slots: Vec<Option<Node>> = Vec::with_capacity(records.len());
+        for (index, record) in records.into_iter().enumerate() {
+            let parent = match (index, record.parent) {
+                (0, None) => None,
+                (0, Some(_)) | (_, None) => return Err(MapError::InvalidRoot),
+                (_, Some(parent)) if parent >= index => {
+                    return Err(MapError::InvalidParent { index, parent });
+                }
+                (_, Some(parent)) => {
+                    // Every earlier slot is filled, so this lookup always succeeds.
+                    if let Some(parent_node) = slots[parent].as_mut() {
+                        parent_node.children.push(NodeId(index));
+                    }
+                    Some(NodeId(parent))
+                }
+            };
+            slots.push(Some(Node {
+                text: record.text,
+                position: record.position,
+                parent,
+                children: Vec::new(),
+            }));
+        }
+        Ok(Self {
+            slots,
+            free: Vec::new(),
+            root: NodeId(0),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_map() -> (MindMap, NodeId, NodeId, NodeId) {
+        let mut map = MindMap::new("root");
+        let a = map.add_child(map.root(), "a").expect("root exists");
+        let b = map.add_child(map.root(), "b").expect("root exists");
+        let a1 = map.add_child(a, "a1").expect("a exists");
+        (map, a, b, a1)
+    }
+
+    #[test]
+    fn new_map_has_only_root() {
+        let map = MindMap::new("center");
+
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+        let root = map.node(map.root()).expect("root exists");
+        assert_eq!(root.text(), "center");
+        assert_eq!(root.parent(), None);
+    }
+
+    #[test]
+    fn add_child_links_parent_and_places_node() {
+        let (map, a, b, a1) = sample_map();
+
+        assert_eq!(map.node(map.root()).expect("root").children(), &[a, b]);
+        assert_eq!(map.node(a1).expect("a1").parent(), Some(a));
+        let a_pos = map.node(a).expect("a").position();
+        let b_pos = map.node(b).expect("b").position();
+        assert_eq!(a_pos, Point::new(CHILD_OFFSET_X, 0.0));
+        assert_eq!(b_pos, Point::new(CHILD_OFFSET_X, SIBLING_OFFSET_Y));
+    }
+
+    #[test]
+    fn child_of_left_branch_grows_left() {
+        let mut map = MindMap::new("root");
+        let left = map.add_child(map.root(), "left").expect("root exists");
+        map.translate_subtree(left, -2.0 * CHILD_OFFSET_X, 0.0)
+            .expect("left exists");
+
+        let grandchild = map.add_child(left, "x").expect("left exists");
+
+        let x = map.node(grandchild).expect("grandchild").position().x;
+        assert_eq!(x, -2.0 * CHILD_OFFSET_X);
+    }
+
+    #[test]
+    fn add_child_to_missing_parent_fails() {
+        let mut map = MindMap::new("root");
+
+        let result = map.add_child(NodeId(42), "x");
+
+        assert_eq!(result, Err(MapError::NodeNotFound(NodeId(42))));
+    }
+
+    #[test]
+    fn add_sibling_uses_same_parent_and_rejects_root() {
+        let (mut map, a, _, a1) = sample_map();
+
+        let sibling = map.add_sibling(a1, "a2").expect("a1 exists");
+
+        assert_eq!(map.node(sibling).expect("a2").parent(), Some(a));
+        assert_eq!(map.add_sibling(map.root(), "x"), Err(MapError::RootNode));
+    }
+
+    #[test]
+    fn set_text_replaces_label() {
+        let (mut map, a, _, _) = sample_map();
+
+        map.set_text(a, "renamed").expect("a exists");
+
+        assert_eq!(map.node(a).expect("a").text(), "renamed");
+    }
+
+    #[test]
+    fn translate_subtree_moves_descendants_only() {
+        let (mut map, a, b, a1) = sample_map();
+        let before_b = map.node(b).expect("b").position();
+        let before_a1 = map.node(a1).expect("a1").position();
+
+        map.translate_subtree(a, 10.0, -5.0).expect("a exists");
+
+        assert_eq!(map.node(b).expect("b").position(), before_b);
+        let after_a1 = map.node(a1).expect("a1").position();
+        assert_eq!(after_a1, Point::new(before_a1.x + 10.0, before_a1.y - 5.0));
+    }
+
+    #[test]
+    fn remove_subtree_frees_and_reuses_slots() {
+        let (mut map, a, b, a1) = sample_map();
+
+        assert_eq!(map.remove_subtree(a), Ok(2));
+
+        assert_eq!(map.len(), 2);
+        assert!(map.node(a).is_none());
+        assert!(map.node(a1).is_none());
+        assert_eq!(map.node(map.root()).expect("root").children(), &[b]);
+        let reused = map.add_child(b, "new").expect("b exists");
+        assert!(reused == a || reused == a1);
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn remove_root_is_rejected() {
+        let mut map = MindMap::new("root");
+
+        assert_eq!(map.remove_subtree(map.root()), Err(MapError::RootNode));
+    }
+
+    #[test]
+    fn preorder_visits_parents_first_with_branch_indices() {
+        let (map, a, b, a1) = sample_map();
+
+        let visits: Vec<(NodeId, Option<usize>)> = map
+            .preorder()
+            .map(|visit| (visit.id, visit.branch))
+            .collect();
+
+        assert_eq!(
+            visits,
+            vec![
+                (map.root(), None),
+                (a, Some(0)),
+                (a1, Some(0)),
+                (b, Some(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn iter_yields_every_live_node() {
+        let (map, _, _, _) = sample_map();
+
+        assert_eq!(map.iter().count(), map.len());
+    }
+
+    #[test]
+    fn records_round_trip() {
+        let (mut map, a, _, _) = sample_map();
+        map.remove_subtree(a).expect("a exists");
+        map.add_child(map.root(), "c").expect("root exists");
+
+        let rebuilt = MindMap::from_records(map.to_records()).expect("records are valid");
+
+        assert_eq!(rebuilt.to_records(), map.to_records());
+        assert_eq!(rebuilt.len(), map.len());
+    }
+
+    #[test]
+    fn from_records_rejects_invalid_input() {
+        let record = |parent| NodeRecord {
+            parent,
+            text: String::new(),
+            position: Point::default(),
+        };
+
+        assert_eq!(MindMap::from_records(Vec::new()), Err(MapError::Empty));
+        assert_eq!(
+            MindMap::from_records(vec![record(Some(0))]),
+            Err(MapError::InvalidRoot)
+        );
+        assert_eq!(
+            MindMap::from_records(vec![record(None), record(None)]),
+            Err(MapError::InvalidRoot)
+        );
+        assert_eq!(
+            MindMap::from_records(vec![record(None), record(Some(1))]),
+            Err(MapError::InvalidParent {
+                index: 1,
+                parent: 1
+            })
+        );
+    }
+}
