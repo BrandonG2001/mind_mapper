@@ -1,7 +1,8 @@
 //! Mind Mapper: a desktop mind-mapping application built with egui.
 //!
 //! * [`model`] - the tree of ideas and its editing operations
-//! * [`history`] - undo/redo
+//! * [`history`] - undo/redo within a memory budget
+//! * [`background`] - slow work on background threads
 //! * [`camera`] - pan and zoom
 //! * [`storage`] - JSON load/save
 //! * [`clipboard`] - cut, copy and paste of branches as outlines
@@ -21,6 +22,7 @@
 //! * [`app`] - the graphical user interface
 
 pub mod app;
+pub mod background;
 pub mod camera;
 pub mod clipboard;
 pub mod details;

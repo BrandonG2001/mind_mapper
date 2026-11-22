@@ -93,6 +93,31 @@ impl Recovered {
     }
 }
 
+/// Writes one window's recovery file; cheap to clone and send to a background thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryWriter {
+    path: PathBuf,
+}
+
+impl RecoveryWriter {
+    /// Write `map` as the recovery copy, atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Io` or `StorageError::Json` if the file cannot be written.
+    pub fn save(&self, map: &MindMap, source: Option<&Path>) -> Result<(), StorageError> {
+        let file = RecoveryFile {
+            version: FORMAT_VERSION,
+            source,
+            nodes: map.to_records(),
+        };
+        write_atomically(&self.path, |writer| {
+            serde_json::to_writer(writer, &file)?;
+            Ok(())
+        })
+    }
+}
+
 /// This window's recovery file, plus the lock that marks it as in use.
 #[derive(Debug)]
 pub struct RecoveryStore {
@@ -146,15 +171,16 @@ impl RecoveryStore {
     ///
     /// Returns `StorageError::Io` or `StorageError::Json` if the file cannot be written.
     pub fn save(&self, map: &MindMap, source: Option<&Path>) -> Result<(), StorageError> {
-        let file = RecoveryFile {
-            version: FORMAT_VERSION,
-            source,
-            nodes: map.to_records(),
-        };
-        write_atomically(&self.path, |writer| {
-            serde_json::to_writer(writer, &file)?;
-            Ok(())
-        })
+        self.writer().save(map, source)
+    }
+
+    /// A handle that can write this window's recovery copy from another thread. (The
+    /// store itself stays on the UI thread, since it owns the window's lock.)
+    #[must_use]
+    pub fn writer(&self) -> RecoveryWriter {
+        RecoveryWriter {
+            path: self.path.clone(),
+        }
     }
 
     /// Read this window's recovery copy, if there is one.

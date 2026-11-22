@@ -9,10 +9,11 @@ use eframe::egui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 
+use crate::background::{Job, JobState};
 use crate::clipboard;
 use crate::details::{self, DetailsEdit, DetailsPanel, color_palette};
-use crate::export::{self, ExportStyle};
-use crate::history::History;
+use crate::export::{self, ExportError, ExportStyle};
+use crate::history::{History, HistoryLimits};
 use crate::layout;
 use crate::map_view::{BASE_FONT_SIZE, LINE_HEIGHT, MapView};
 use crate::model::{MapError, MindMap, Node, NodeId};
@@ -22,7 +23,7 @@ use crate::recovery::{Recovered, RecoveryStore};
 use crate::search::{Search, SearchCommand};
 use crate::settings::{Settings, SettingsFile};
 use crate::start_screen::{StartChoice, StartContext, StartScreen};
-use crate::storage;
+use crate::storage::{self, StorageError};
 use crate::theme::{self, ColorTheme, theme_picker, ui_size_control};
 
 /// Application name: window title, and the folder name for settings and recovery data.
@@ -34,7 +35,12 @@ const MIN_EDITOR_WIDTH: f32 = 140.0;
 /// Space above and below the text inside the label editor, at 100% zoom.
 const EDITOR_PADDING: f32 = 8.0;
 /// Number of undo steps kept.
-const HISTORY_LIMIT: usize = 200;
+const HISTORY_LIMITS: HistoryLimits = HistoryLimits {
+    max_steps: 200,
+    // Each step is a full copy of the map; about 16 MB at 100,000 nodes.
+    max_bytes: 256 * 1024 * 1024,
+    min_steps: 10,
+};
 /// How strongly one scroll-wheel pixel changes the zoom.
 const SCROLL_ZOOM_SPEED: f32 = 0.0015;
 /// Label of the root node in a new map.
@@ -251,6 +257,12 @@ pub struct MindMapApp {
     details: Option<DetailsPanel>,
     /// The node the right-click menu was opened on.
     context_node: Option<NodeId>,
+    /// egui context, to wake the window when background jobs finish.
+    ctx: egui::Context,
+    /// Exports running in the background, with the file name for status messages.
+    exports: Vec<(String, Job<Result<(), ExportError>>)>,
+    /// The recovery copy being written in the background, if any.
+    recovery_job: Option<Job<Result<(), StorageError>>>,
     /// Increases with every edit, so cached results (search matches) know to refresh.
     revision: u64,
 }
@@ -271,6 +283,7 @@ impl MindMapApp {
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<&Path>) -> Self {
         let mut app = Self::with_map(MindMap::new(DEFAULT_ROOT_TEXT));
+        app.ctx = cc.egui_ctx.clone();
         let data_dir = eframe::storage_dir(APP_NAME);
         app.settings_file = data_dir.as_deref().map(SettingsFile::in_dir);
         let settings = match &app.settings_file {
@@ -318,7 +331,7 @@ impl MindMapApp {
             screen: Screen::Start { can_return: false },
             start: StartScreen::default(),
             map,
-            history: History::new(HISTORY_LIMIT),
+            history: History::new(HISTORY_LIMITS),
             view: MapView::default(),
             selected: None,
             editing: None,
@@ -342,6 +355,9 @@ impl MindMapApp {
             search: None,
             details: None,
             context_node: None,
+            ctx: egui::Context::default(),
+            exports: Vec::new(),
+            recovery_job: None,
             revision: 0,
         }
     }
@@ -387,18 +403,84 @@ impl MindMapApp {
             ctx.request_repaint_after(Duration::from_secs_f64(due - now));
             return;
         }
-        self.save_recovery_copy();
+        // One copy at a time: if the previous one is still being written, try again on
+        // a later frame (changes stay pending).
+        if self.recovery_job.is_some() {
+            return;
+        }
+        let Some(store) = &self.recovery else {
+            return;
+        };
+        // Copying the map is quick; turning it into JSON and writing it is the slow part
+        // (about 40 ms at 100,000 nodes), so that happens on a background thread.
+        let writer = store.writer();
+        let map = self.map.clone();
+        let source = self.file_path.clone();
+        self.recovery_job = Some(Job::spawn(&self.ctx, "recovery-copy", move || {
+            writer.save(&map, source.as_deref())
+        }));
+        self.autosave_pending = false;
         self.last_autosave = now;
     }
 
-    /// Write this window's recovery copy now.
+    /// Write this window's recovery copy now, on this thread.
     fn save_recovery_copy(&mut self) {
+        // A background write of the same file must not land after this one.
+        self.finish_recovery_job();
         if let Some(store) = &self.recovery
             && let Err(err) = store.save(&self.map, self.file_path.as_deref())
         {
             self.status = format!("Auto-save failed: {err}");
         }
         self.autosave_pending = false;
+    }
+
+    /// Wait for a background recovery copy still being written, and report any error.
+    fn finish_recovery_job(&mut self) {
+        if let Some(job) = self.recovery_job.take() {
+            self.report_recovery_result(job.wait());
+        }
+    }
+
+    fn report_recovery_result(&mut self, result: Option<Result<(), StorageError>>) {
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(err)) => self.status = format!("Auto-save failed: {err}"),
+            None => "Auto-save failed unexpectedly".clone_into(&mut self.status),
+        }
+    }
+
+    /// Collect the results of background jobs that have finished.
+    fn poll_jobs(&mut self) {
+        if let Some(job) = &self.recovery_job {
+            match job.poll() {
+                JobState::Running => {}
+                JobState::Finished(result) => {
+                    self.recovery_job = None;
+                    self.report_recovery_result(Some(result));
+                }
+                JobState::Failed => {
+                    self.recovery_job = None;
+                    self.report_recovery_result(None);
+                }
+            }
+        }
+        let mut messages = Vec::new();
+        self.exports.retain(|(name, job)| {
+            let message = match job.poll() {
+                JobState::Running => return true,
+                JobState::Finished(Ok(())) => format!("Exported {name}"),
+                JobState::Finished(Err(err)) => format!("Could not export {name}: {err}"),
+                JobState::Failed => {
+                    format!("Could not export {name}: the export stopped unexpectedly")
+                }
+            };
+            messages.push(message);
+            false
+        });
+        if let Some(last) = messages.pop() {
+            self.status = last;
+        }
     }
 
     /// Look for unsaved work left by a window that is no longer running.
@@ -422,6 +504,8 @@ impl MindMapApp {
 
     /// Delete the recovery copy (after a save, or once the user discards their work).
     fn clear_recovery(&mut self) {
+        // A background write finishing after the delete would bring the file back.
+        self.finish_recovery_job();
         if let Some(store) = &self.recovery
             && let Err(err) = store.clear()
         {
@@ -599,7 +683,7 @@ impl MindMapApp {
 
     fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
         self.map = map;
-        self.history = History::new(HISTORY_LIMIT);
+        self.history = History::new(HISTORY_LIMITS);
         self.selected = None;
         self.editing = None;
         self.drag = None;
@@ -725,12 +809,19 @@ impl MindMapApp {
     }
 
     /// Export the map to `path` (format from its extension) in the current theme's colours.
+    ///
+    /// Runs on a background thread (a PNG of a huge map takes seconds); the status line
+    /// reports the result when it is done.
     fn export_to(&mut self, path: &Path) {
         let style = ExportStyle::from_visuals(&self.theme.visuals());
-        self.status = match export::export(&self.map, style, path) {
-            Ok(()) => format!("Exported {}", file_label(path)),
-            Err(err) => format!("Could not export {}: {err}", file_label(path)),
-        };
+        let name = file_label(path).into_owned();
+        self.status = format!("Exporting {name}...");
+        let map = self.map.clone();
+        let path = path.to_owned();
+        let job = Job::spawn(&self.ctx, "export", move || {
+            export::export(&map, style, &path)
+        });
+        self.exports.push((name, job));
     }
 
     /// Ask before throwing away unsaved (or recovered) work. If the user agrees, the
@@ -1384,6 +1475,7 @@ fn file_dialog() -> FileDialog {
 impl eframe::App for MindMapApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_window(ui);
+        self.poll_jobs();
         self.autosave(ui.ctx());
         self.handle_shortcuts(ui);
         if let Screen::Start { can_return } = self.screen {
@@ -1669,9 +1761,20 @@ mod tests {
         let dir = TempDir::new("app_export");
         let (mut app, _) = app_with_child();
 
+        let finish = |app: &mut MindMapApp| {
+            while !app.exports.is_empty() {
+                app.poll_jobs();
+                std::thread::yield_now();
+            }
+        };
+
         app.export_to(&dir.path().join("map.md"));
+        assert_eq!(app.status, "Exporting map.md...");
+        finish(&mut app);
         assert_eq!(app.status, "Exported map.md");
+        assert!(dir.path().join("map.md").exists());
         app.export_to(&dir.path().join("map.txt"));
+        finish(&mut app);
 
         assert!(app.status.starts_with("Could not export map.txt"));
     }
@@ -1910,9 +2013,44 @@ mod tests {
 
         app.last_autosave = -AUTOSAVE_SECONDS;
         app.autosave(&ctx);
+        assert!(app.recovery_job.is_some(), "written in the background");
+        app.finish_recovery_job();
 
         assert_eq!(saved_copy(&app).expect("copy written").map, app.map);
         assert!(!app.autosave_pending);
+    }
+
+    #[test]
+    fn clearing_waits_for_a_background_copy_so_none_is_left() {
+        let dir = TempDir::new("app_clear_waits");
+        let ctx = egui::Context::default();
+        let (mut app, _) = app_with_child();
+        app.recovery = Some(RecoveryStore::for_this_window(dir.path()).expect("store"));
+        app.last_autosave = -AUTOSAVE_SECONDS;
+        app.autosave(&ctx);
+
+        app.clear_recovery();
+
+        assert!(app.recovery_job.is_none());
+        let store = app.recovery.as_ref().expect("store");
+        assert!(store.load().expect("readable").is_none());
+    }
+
+    #[test]
+    fn huge_maps_keep_fewer_undo_steps() {
+        let mut map = MindMap::new("root");
+        // About 8 MB of notes: the 256 MB budget then fits about 30 snapshots, not 200.
+        let root = map.root();
+        map.set_note(root, &"x".repeat(8 * 1024 * 1024))
+            .expect("root");
+        let mut app = MindMapApp::with_map(map);
+
+        for step in 0..60 {
+            app.edit_map(|map| map.set_text(root, &format!("step {step}")));
+        }
+
+        let kept = app.history.undo_steps();
+        assert!((10..60).contains(&kept), "kept {kept} steps");
     }
 
     #[test]

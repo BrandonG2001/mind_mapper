@@ -29,7 +29,8 @@ keyboard, drag branches around and save your maps as plain JSON files.
   document, or paste a bulleted list from anywhere into the map.
 - **Smooth navigation**: zoom with the scroll wheel (anchored at the cursor) and pan by
   dragging the background.
-- **Undo/redo**: up to 200 steps.
+- **Undo/redo**: up to 200 steps (fewer on very large maps, so undo history stays within
+  about 256 MB).
 - **Seven colour themes**: Dark, Light, Light grey, Dark grey, Dark blue, Light purple and
   Dark purple. Your choice is remembered between runs.
 - **Adjustable interface size** (toolbar or Ctrl +/-), also remembered between runs.
@@ -203,7 +204,8 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | File | Purpose |
 |---|---|
 | [`src/model.rs`](src/model.rs) | The mind-map tree and its editing operations |
-| [`src/history.rs`](src/history.rs) | Undo/redo |
+| [`src/history.rs`](src/history.rs) | Undo/redo within a memory budget |
+| [`src/background.rs`](src/background.rs) | Exports and recovery copies on background threads |
 | [`src/camera.rs`](src/camera.rs) | Pan and zoom transform |
 | [`src/storage.rs`](src/storage.rs) | JSON load and save, atomic file writes |
 | [`src/recovery.rs`](src/recovery.rs) | Background copy of unsaved work for crash recovery |

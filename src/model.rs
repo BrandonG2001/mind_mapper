@@ -5,6 +5,8 @@
 //! testing stable from frame to frame. Freed slots are reused through a free list.
 
 use serde::{Deserialize, Serialize};
+
+use crate::history::HeapSize;
 use thiserror::Error;
 
 /// Horizontal distance between a parent and a newly created child.
@@ -239,6 +241,24 @@ pub struct NodeRecord {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_false(flag: &bool) -> bool {
     !*flag
+}
+
+impl HeapSize for MindMap {
+    /// Slot table plus every node's text, notes, link and child list.
+    fn heap_size(&self) -> usize {
+        let slots = self.slots.capacity() * std::mem::size_of::<Option<Node>>()
+            + self.free.capacity() * std::mem::size_of::<usize>();
+        let nodes: usize = self
+            .iter()
+            .map(|(_, node)| {
+                node.text.capacity()
+                    + node.note.capacity()
+                    + node.link.as_ref().map_or(0, String::capacity)
+                    + node.children.capacity() * std::mem::size_of::<NodeId>()
+            })
+            .sum();
+        std::mem::size_of::<Self>() + slots + nodes
+    }
 }
 
 /// A node visited by [`MindMap::preorder`].
@@ -1077,6 +1097,16 @@ mod tests {
 
         assert_eq!(map.node(a).expect("a").position(), Point::new(5.0, 6.0));
         assert_eq!(map.node(a1).expect("a1").position(), child_before);
+    }
+
+    #[test]
+    fn heap_size_grows_with_content() {
+        let mut map = MindMap::new("root");
+        let small = map.heap_size();
+        let child = map.add_child(map.root(), "child").expect("root");
+        map.set_note(child, &"note ".repeat(100)).expect("child");
+
+        assert!(map.heap_size() >= small + 500);
     }
 
     #[test]
