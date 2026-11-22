@@ -188,7 +188,7 @@ impl MindMapApp {
 
     /// Show the in-place text box for the node being edited.
     pub(super) fn show_editor(&mut self, ui: &mut Ui) {
-        let Some(session) = self.editing.as_mut() else {
+        let Some(session) = self.editing.as_mut().filter(|session| !session.in_outline) else {
             return;
         };
         let Some(node_rect) = self.view.node_rect(session.id) else {
@@ -237,6 +237,12 @@ impl MindMapApp {
     pub(super) fn canvas(&mut self, ui: &mut Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         self.check_focus();
+        // Image files dropped from the file manager go onto the node under the pointer.
+        let dropped = ui.input(|input| input.raw.dropped_files.clone());
+        if let Some(file) = dropped.first() {
+            let hovered_at = ui.input(|input| input.pointer.hover_pos());
+            self.drop_picture(file.path(), file.bytes(), hovered_at);
+        }
         if self.needs_fit {
             self.view.fit(&self.map, response.rect);
             self.needs_fit = false;
@@ -368,17 +374,37 @@ impl MindMapApp {
                 ui.close();
             }
         }
+        ui.separator();
+        if ui.button("Add picture...").clicked() {
+            ui.close();
+            self.choose_picture(id);
+        }
+        let has_picture = self
+            .map
+            .node(id)
+            .is_some_and(|node| node.picture().is_some());
+        if has_picture && ui.button("Remove picture").clicked() {
+            self.remove_picture(id);
+            ui.close();
+        }
         let links = self.links_of(id);
         if !links.is_empty() {
             ui.separator();
         }
         for (other, outgoing) in links {
             let direction = if outgoing { "to" } else { "from" };
-            let label = format!(
-                "Remove link {direction} \"{}\"",
-                node_label(&self.map, other)
-            );
-            if ui.button(label).clicked() {
+            let other_label = node_label(&self.map, other);
+            if ui
+                .button(format!("Label link {direction} \"{other_label}\"..."))
+                .clicked()
+            {
+                self.edit_link_label(id, other);
+                ui.close();
+            }
+            if ui
+                .button(format!("Remove link {direction} \"{other_label}\""))
+                .clicked()
+            {
                 self.remove_link(id, other);
                 ui.close();
             }

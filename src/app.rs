@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui::{self, Event, Key, KeyboardShortcut, Modifiers, Ui, ViewportCommand};
 
@@ -30,7 +31,9 @@ mod editing;
 mod files;
 mod focus;
 mod links;
+mod outline;
 mod panels;
+mod pictures;
 mod questions;
 mod selection;
 mod updates;
@@ -95,19 +98,27 @@ enum Action {
     ToggleDetails,
     /// Show only the selected branch, or the whole map again.
     ToggleFocus,
+    /// Show or hide the outline panel.
+    ToggleOutline,
 }
 
 /// A clipboard request, which egui reports as an event rather than a key press.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ClipboardRequest {
     Copy,
     Cut,
     Paste(String),
+    /// An image was pasted (the clipboard held a picture rather than text).
+    PasteImage(std::sync::Arc<egui::ColorImage>),
 }
 
 /// Keyboard shortcuts. Variants with Shift come first because a shortcut without Shift
 /// also matches when Shift is held.
-const SHORTCUTS: [(KeyboardShortcut, Action); 28] = [
+const SHORTCUTS: [(KeyboardShortcut, Action); 29] = [
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O),
+        Action::ToggleOutline,
+    ),
     // Before the plain arrows, which also match while Alt is held.
     (
         KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp),
@@ -238,6 +249,8 @@ struct EditSession {
     id: NodeId,
     buffer: String,
     request_focus: bool,
+    /// Edited in the outline panel's row rather than over the node on the canvas.
+    in_outline: bool,
 }
 
 /// What the current mouse drag is doing.
@@ -291,6 +304,10 @@ pub struct MindMapApp {
     template_folder: Option<TemplateFolder>,
     /// The node a cross-link is being drawn from, until the target is clicked.
     linking: Option<NodeId>,
+    /// A cross-link label being edited in a pop-up.
+    label_edit: Option<links::LabelEdit>,
+    /// The outline panel, while it is open.
+    outline: Option<outline::Outline>,
     /// A question shown over the window, waiting for the user's answer.
     question: Option<Question>,
     /// The map changed since the last recovery copy was written.
@@ -409,6 +426,8 @@ impl MindMapApp {
             deferred_open: None,
             question: None,
             linking: None,
+            label_edit: None,
+            outline: None,
             template_folder: None,
             updates: updates::Updates::default(),
             also_selected: HashSet::new(),
@@ -529,6 +548,7 @@ impl MindMapApp {
             }
             Action::StartLink => self.start_link(),
             Action::ToggleFocus => self.toggle_focus(),
+            Action::ToggleOutline => self.toggle_outline(),
             Action::ToggleDetails => {
                 if self.details.take().is_none() {
                     self.details = Some(DetailsPanel::default());
@@ -585,7 +605,10 @@ impl MindMapApp {
     fn handle_shortcuts(&mut self, ui: &Ui) {
         // While a text field has focus, keys (and Ctrl+C/X/V) belong to it; while a
         // question is open, they belong to the question.
-        if self.editing.is_some() || self.question.is_some() || ui.ctx().egui_wants_keyboard_input()
+        if self.editing.is_some()
+            || self.question.is_some()
+            || self.label_edit.is_some()
+            || ui.ctx().egui_wants_keyboard_input()
         {
             return;
         }
@@ -617,6 +640,7 @@ impl MindMapApp {
                 Event::Copy => Some(ClipboardRequest::Copy),
                 Event::Cut => Some(ClipboardRequest::Cut),
                 Event::Paste(text) => Some(ClipboardRequest::Paste(text.clone())),
+                Event::PasteImage(image) => Some(ClipboardRequest::PasteImage(Arc::clone(image))),
                 _ => None,
             })
         });
@@ -624,6 +648,7 @@ impl MindMapApp {
             Some(ClipboardRequest::Copy) => self.copy_branch(ctx, false),
             Some(ClipboardRequest::Cut) => self.copy_branch(ctx, true),
             Some(ClipboardRequest::Paste(text)) => self.paste_outline(&text),
+            Some(ClipboardRequest::PasteImage(image)) => self.paste_picture(&image),
             None => {}
         }
     }
@@ -651,6 +676,7 @@ impl eframe::App for MindMapApp {
         self.handle_window(ui);
         // Before the panels, so they already ignore clicks while a question is open.
         self.show_question(ui.ctx());
+        self.show_label_editor(ui.ctx());
         self.poll_jobs();
         self.autosave(ui.ctx());
         self.handle_shortcuts(ui);
@@ -692,6 +718,7 @@ impl eframe::App for MindMapApp {
                 self.search_command(command);
             }
         }
+        self.outline_panel(ui);
         self.details_panel(ui);
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
     }

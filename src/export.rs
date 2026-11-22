@@ -12,7 +12,8 @@ use std::sync::Arc;
 use eframe::egui::{Color32, Pos2, Rect, Vec2, Visuals};
 use krilla::Document;
 use krilla::color::rgb;
-use krilla::geom::{Path as PdfPath, PathBuilder, Point as KrillaPoint, Transform};
+use krilla::geom::{Path as PdfPath, PathBuilder, Point as KrillaPoint, Size, Transform};
+use krilla::image::Image;
 use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, Stroke, StrokeDash};
@@ -23,10 +24,12 @@ use thiserror::Error;
 use crate::clipboard;
 use crate::formats::{Format, freemind, opml, push_escaped};
 use crate::map_view::{
-    ARROW_SIZE, Accents, BASE_FONT_SIZE, LINE_HEIGHT, LINK_DASH, LINK_OPACITY, LINK_WIDTH,
-    arrow_head, cross_link_curve, estimated_rect, wrap_label,
+    ARROW_SIZE, Accents, BASE_FONT_SIZE, LINE_HEIGHT, LINK_DASH, LINK_LABEL_SCALE, LINK_OPACITY,
+    LINK_WIDTH, arrow_head, cross_link_curve, curve_midpoint, estimated_link_label_size,
+    estimated_rect, node_contents, wrap_label,
 };
 use crate::model::{MindMap, NodeId};
+use crate::picture::{Picture, PictureFormat};
 use crate::storage::{StorageError, write_atomically};
 use crate::theme::ColorTheme;
 
@@ -157,7 +160,7 @@ struct Scene<'a> {
     /// Curves from each parent to each child, drawn first so node boxes cover their ends.
     edges: Vec<SceneEdge>,
     /// Cross-links whose ends are both shown, drawn over the edges as dashed arrows.
-    links: Vec<[Pos2; 4]>,
+    links: Vec<SceneLink<'a>>,
     /// Node boxes with their labels, drawn over the edges and links.
     nodes: Vec<SceneNode<'a>>,
 }
@@ -169,10 +172,18 @@ struct SceneEdge {
     color: Color32,
 }
 
+/// A cross-link's curve and, if it has a label, the label's backing and lines.
+struct SceneLink<'a> {
+    curve: [Pos2; 4],
+    label: Option<(Rect, Vec<(Pos2, &'a str)>)>,
+}
+
 /// A node's box and the lines of its label.
 struct SceneNode<'a> {
     rect: Rect,
     accent: Color32,
+    /// The node's picture and where it goes, above the label.
+    picture: Option<(Rect, &'a Picture)>,
     /// Each line's horizontal centre and baseline, with its text.
     lines: Vec<(Pos2, &'a str)>,
 }
@@ -209,22 +220,12 @@ impl<'a> Scene<'a> {
             let world_rect = estimated_rect(visit.node);
             let rect = Rect::from_min_size(at(world_rect.min), world_rect.size());
             boxes[visit.id.index()] = Some(rect);
-            let line_count =
-                f32::from(u16::try_from(wrap_label(visit.node.text()).count()).unwrap_or(u16::MAX));
-            // Baseline of the first line: lines are centred as a block, and a baseline
-            // sits about 0.35 em below the middle of its line.
-            let first_baseline =
-                rect.center().y - (line_count - 1.0) * LINE_HEIGHT * 0.5 + BASE_FONT_SIZE * 0.35;
-            let lines = wrap_label(visit.node.text())
-                .scan(first_baseline, |baseline, line| {
-                    let anchor = Pos2::new(rect.center().x, *baseline);
-                    *baseline += LINE_HEIGHT;
-                    Some((anchor, line))
-                })
-                .collect();
+            let (picture_place, label_center) = node_contents(visit.node, rect);
+            let lines = centred_lines(visit.node.text(), label_center, BASE_FONT_SIZE);
             nodes.push(SceneNode {
                 rect,
                 accent,
+                picture: picture_place.zip(visit.node.picture()),
                 lines,
             });
         }
@@ -232,7 +233,17 @@ impl<'a> Scene<'a> {
         let links = map
             .cross_links()
             .iter()
-            .filter_map(|link| Some(cross_link_curve(box_of(link.from())?, box_of(link.to())?)))
+            .filter_map(|link| {
+                let curve = cross_link_curve(box_of(link.from())?, box_of(link.to())?);
+                let label = (!link.label().is_empty()).then(|| {
+                    let middle = curve_midpoint(curve);
+                    let backing =
+                        Rect::from_center_size(middle, estimated_link_label_size(link.label()));
+                    let size = BASE_FONT_SIZE * LINK_LABEL_SCALE;
+                    (backing, centred_lines(link.label(), middle, size))
+                });
+                Some(SceneLink { curve, label })
+            })
             .collect();
         Self {
             size: bounds.size(),
@@ -241,6 +252,22 @@ impl<'a> Scene<'a> {
             nodes,
         }
     }
+}
+
+/// The lines of `text` as a label of font `size`, centred as a block on `center`: each
+/// line's horizontal centre and baseline, with its text.
+fn centred_lines(text: &str, center: Pos2, size: f32) -> Vec<(Pos2, &str)> {
+    let line_height = LINE_HEIGHT * size / BASE_FONT_SIZE;
+    let count = f32::from(u16::try_from(wrap_label(text).count()).unwrap_or(u16::MAX));
+    // A baseline sits about 0.35 em below the middle of its line.
+    let first_baseline = center.y - (count - 1.0) * line_height * 0.5 + size * 0.35;
+    wrap_label(text)
+        .scan(first_baseline, |baseline, line| {
+            let anchor = Pos2::new(center.x, *baseline);
+            *baseline += line_height;
+            Some((anchor, line))
+        })
+        .collect()
 }
 
 /// The visible part of the map as a standalone SVG document.
@@ -276,20 +303,32 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
         )?;
     }
     let link_color = hex(style.text);
-    for &curve in &scene.links {
+    for link in &scene.links {
         writeln!(
             out,
             r#"<path d="{}" fill="none" stroke="{link_color}" stroke-opacity="{LINK_OPACITY}" stroke-width="{LINK_WIDTH}" stroke-dasharray="{} {}"/>"#,
-            curve_data(curve),
+            curve_data(link.curve),
             LINK_DASH[0],
             LINK_DASH[1],
         )?;
-        let [tip, left, right] = arrow_head(curve, ARROW_SIZE);
+        let [tip, left, right] = arrow_head(link.curve, ARROW_SIZE);
         writeln!(
             out,
             r#"<polygon points="{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{link_color}" fill-opacity="{LINK_OPACITY}"/>"#,
             tip.x, tip.y, left.x, left.y, right.x, right.y,
         )?;
+        if let Some((backing, lines)) = &link.label {
+            writeln!(
+                out,
+                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="{CORNER_RADIUS}" fill="{}" stroke="{link_color}" stroke-opacity="{LINK_OPACITY}" stroke-width="{LINK_WIDTH}"/>"#,
+                backing.min.x,
+                backing.min.y,
+                backing.width(),
+                backing.height(),
+                hex(style.node_fill),
+            )?;
+            write_text(out, lines, BASE_FONT_SIZE * LINK_LABEL_SCALE, style.text)?;
+        }
     }
     for node in &scene.nodes {
         let rect = node.rect;
@@ -303,19 +342,36 @@ fn write_svg(out: &mut String, scene: &Scene<'_>, style: ExportStyle) -> fmt::Re
             hex(style.node_fill),
             hex(node.accent),
         )?;
-        write!(
-            out,
-            r#"<text font-family="{FONT_FAMILY}" font-size="{BASE_FONT_SIZE}" fill="{}" text-anchor="middle">"#,
-            hex(style.text)
-        )?;
-        for &(anchor, line) in &node.lines {
-            write!(out, r#"<tspan x="{:.1}" y="{:.1}">"#, anchor.x, anchor.y)?;
-            push_escaped(out, line);
-            out.push_str("</tspan>");
+        if let Some((place, picture)) = node.picture {
+            writeln!(
+                out,
+                r#"<image x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" href="{}"/>"#,
+                place.min.x,
+                place.min.y,
+                place.width(),
+                place.height(),
+                picture.to_data_url(),
+            )?;
         }
-        out.push_str("</text>\n");
+        write_text(out, &node.lines, BASE_FONT_SIZE, style.text)?;
     }
     out.push_str("</svg>\n");
+    Ok(())
+}
+
+/// An SVG `<text>` element with one centred `<tspan>` per line.
+fn write_text(out: &mut String, lines: &[(Pos2, &str)], size: f32, color: Color32) -> fmt::Result {
+    write!(
+        out,
+        r#"<text font-family="{FONT_FAMILY}" font-size="{size}" fill="{}" text-anchor="middle">"#,
+        hex(color)
+    )?;
+    for &(anchor, line) in lines {
+        write!(out, r#"<tspan x="{:.1}" y="{:.1}">"#, anchor.x, anchor.y)?;
+        push_escaped(out, line);
+        out.push_str("</tspan>");
+    }
+    out.push_str("</text>\n");
     Ok(())
 }
 
@@ -380,8 +436,21 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
             Some(edge.color),
         );
     }
-    for &curve in &scene.links {
-        draw_cross_link(&mut surface, curve, style.text);
+    let text = PdfText {
+        font: &font,
+        face: &face,
+    };
+    for link in &scene.links {
+        draw_cross_link(&mut surface, link.curve, style.text);
+        if let Some((backing, lines)) = &link.label {
+            if let Some(path) = rounded_rect(*backing, CORNER_RADIUS) {
+                surface.set_fill(Some(pdf_fill(style.node_fill)));
+                surface.set_stroke(Some(link_stroke(style.text, None)));
+                surface.draw_path(&path);
+            }
+            surface.set_fill(Some(pdf_fill(style.text)));
+            text.draw(&mut surface, lines, BASE_FONT_SIZE * LINK_LABEL_SCALE);
+        }
     }
     for node in &scene.nodes {
         draw(
@@ -390,21 +459,12 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
             Some(style.node_fill),
             Some(node.accent),
         );
+        if let Some((place, picture)) = node.picture {
+            draw_picture(&mut surface, place, picture)?;
+        }
         surface.set_stroke(None);
         surface.set_fill(Some(pdf_fill(style.text)));
-        for &(anchor, line) in &node.lines {
-            let glyphs = line_glyphs(&face, line);
-            let width: f32 = glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>();
-            let left = anchor.x - width * BASE_FONT_SIZE * 0.5;
-            surface.draw_glyphs(
-                KrillaPoint::from_xy(left, anchor.y),
-                &glyphs,
-                font.clone(),
-                line,
-                BASE_FONT_SIZE,
-                false,
-            );
-        }
+        text.draw(&mut surface, &node.lines, BASE_FONT_SIZE);
     }
     surface.pop();
     surface.finish();
@@ -412,6 +472,32 @@ pub fn to_pdf(map: &MindMap) -> Result<Vec<u8>, ExportError> {
     document
         .finish()
         .map_err(|err| ExportError::Render(format!("{err:?}")))
+}
+
+/// The embedded label font, for drawing text into a PDF.
+struct PdfText<'a> {
+    font: &'a Font,
+    face: &'a ttf_parser::Face<'a>,
+}
+
+impl PdfText<'_> {
+    /// Draw `lines` (each centred on its anchor's x, on its baseline) at font `size`, in
+    /// the surface's current fill.
+    fn draw(&self, surface: &mut krilla::surface::Surface<'_>, lines: &[(Pos2, &str)], size: f32) {
+        surface.set_stroke(None);
+        for &(anchor, line) in lines {
+            let glyphs = line_glyphs(self.face, line);
+            let width: f32 = glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>();
+            surface.draw_glyphs(
+                KrillaPoint::from_xy(anchor.x - width * size * 0.5, anchor.y),
+                &glyphs,
+                self.font.clone(),
+                line,
+                size,
+                false,
+            );
+        }
+    }
 }
 
 /// The glyphs of one label line: one per character, each advancing by its width in
@@ -440,6 +526,31 @@ fn line_glyphs(face: &ttf_parser::Face<'_>, line: &str) -> Vec<KrillaGlyph> {
         .collect()
 }
 
+/// Draw `picture` into the rectangle `place`. JPEG files are embedded as they are; PNG
+/// files are stored losslessly.
+///
+/// # Errors
+///
+/// Returns `ExportError::Render` if the picture cannot be read.
+fn draw_picture(
+    surface: &mut krilla::surface::Surface<'_>,
+    place: Rect,
+    picture: &Picture,
+) -> Result<(), ExportError> {
+    let data = picture.bytes().to_vec().into();
+    let image = match picture.format() {
+        PictureFormat::Png => Image::from_png(data, true),
+        PictureFormat::Jpeg => Image::from_jpeg(data, true),
+    }
+    .map_err(ExportError::Render)?;
+    let size = Size::from_wh(place.width(), place.height())
+        .ok_or_else(|| ExportError::Render("a picture has no size".to_owned()))?;
+    surface.push_transform(&Transform::from_translate(place.min.x, place.min.y));
+    surface.draw_image(image, size);
+    surface.pop();
+    Ok(())
+}
+
 /// A cubic curve as a PDF path.
 fn curve_path([start, first, second, end]: [Pos2; 4]) -> Option<PdfPath> {
     let mut path = PathBuilder::new();
@@ -453,15 +564,13 @@ fn draw_cross_link(surface: &mut krilla::surface::Surface<'_>, curve: [Pos2; 4],
     let opacity = NormalizedF32::new(LINK_OPACITY).unwrap_or(NormalizedF32::ONE);
     if let Some(path) = curve_path(curve) {
         surface.set_fill(None);
-        surface.set_stroke(Some(Stroke {
-            width: LINK_WIDTH,
-            opacity,
-            dash: Some(StrokeDash {
+        surface.set_stroke(Some(link_stroke(
+            color,
+            Some(StrokeDash {
                 array: LINK_DASH.to_vec(),
                 offset: 0.0,
             }),
-            ..pdf_stroke(color)
-        }));
+        )));
         surface.draw_path(&path);
     }
     let [tip, left, right] = arrow_head(curve, ARROW_SIZE);
@@ -477,6 +586,16 @@ fn draw_cross_link(surface: &mut krilla::surface::Surface<'_>, curve: [Pos2; 4],
             ..pdf_fill(color)
         }));
         surface.draw_path(&path);
+    }
+}
+
+/// A translucent line of `color` as wide as a cross-link, optionally dashed.
+fn link_stroke(color: Color32, dash: Option<StrokeDash>) -> Stroke {
+    Stroke {
+        width: LINK_WIDTH,
+        opacity: NormalizedF32::new(LINK_OPACITY).unwrap_or(NormalizedF32::ONE),
+        dash,
+        ..pdf_stroke(color)
     }
 }
 

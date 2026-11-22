@@ -6,6 +6,7 @@ use egui_kittest::Harness;
 // `Queryable` provides `get_by_label` and friends on the harness.
 use egui_kittest::kittest::{NodeT, Queryable};
 
+use super::outline::OutlineEvent;
 use super::{DEFAULT_ROOT_TEXT, MindMapApp, Screen};
 use crate::model::{MindMap, NodeId};
 use crate::start_screen::TemplateId;
@@ -507,8 +508,129 @@ fn link_to_from_the_menu_then_click_the_target() {
     let described = harness.get_by_label("Risk").accesskit_node().description();
     assert_eq!(described.as_deref(), Some("Links to Goals"));
 
+    // Label it from the menu: type, then Enter.
+    right_click(&mut harness, goals);
+    harness.get_by_label("Label link from \"Risk\"...").click();
+    harness.run();
+    harness.run();
+    harness.event(Event::Text("threatens".to_owned()));
+    harness.key_press(Key::Enter);
+    harness.run();
+    assert!(harness.state().label_edit.is_none());
+    assert_eq!(harness.state().map.cross_links()[0].label(), "threatens");
+    let described = harness.get_by_label("Risk").accesskit_node().description();
+    assert_eq!(described.as_deref(), Some("Links to Goals (threatens)"));
+
     right_click(&mut harness, goals);
     harness.get_by_label("Remove link from \"Risk\"").click();
     harness.run();
     assert_eq!(harness.state().links_of(goals), []);
+}
+
+/// The outline's row (not the canvas node) labelled `label`.
+fn outline_row<'h>(
+    harness: &'h Harness<'static, MindMapApp>,
+    label: &'h str,
+) -> Option<egui_kittest::Node<'h>> {
+    harness
+        .query_all_by_label(label)
+        .find(|node| node.accesskit_node().role() != eframe::egui::accesskit::Role::TreeItem)
+}
+
+#[test]
+fn the_outline_lists_the_map_and_edits_it() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    harness.key_press_modifiers(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::O);
+    harness.run();
+    let (risks, mitigation, goals) = {
+        let app = harness.state();
+        (
+            node_named(app, "Risks"),
+            node_named(app, "Mitigation"),
+            node_named(app, "Goals"),
+        )
+    };
+
+    // Clicking a row selects its node.
+    outline_row(&harness, "Risks").expect("row").click();
+    harness.run();
+    assert_eq!(harness.state().selected, Some(risks));
+
+    // Renaming it right there in the list, as a double-click on the row does. (The test
+    // harness does not produce double-clicks, so the rename is started directly.)
+    harness
+        .state_mut()
+        .apply_outline_event(OutlineEvent::Rename(mitigation));
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .editing
+            .as_ref()
+            .is_some_and(|edit| edit.in_outline)
+    );
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.event(Event::Text("Contingency".to_owned()));
+    harness.key_press(Key::Enter);
+    harness.run();
+    let text = harness
+        .state()
+        .map
+        .node(mitigation)
+        .expect("live")
+        .text()
+        .to_owned();
+    assert_eq!(text, "Contingency");
+
+    // The "-" button on the Goals row folds that branch, and its children leave the list.
+    let row = outline_row(&harness, "Goals").expect("row").rect();
+    harness
+        .get_all_by_label("-")
+        .find(|button| {
+            let at = button.rect().center();
+            (at.y - row.center().y).abs() < 2.0 && at.x < row.min.x
+        })
+        .expect("fold button on the Goals row")
+        .click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .map
+            .node(goals)
+            .expect("live")
+            .is_collapsed()
+    );
+    assert!(outline_row(&harness, "Objective 1").is_none());
+}
+
+#[test]
+fn a_pasted_image_appears_on_the_selected_node() {
+    let mut harness = harness();
+    open_template(&mut harness, "Project Plan");
+    let goals = node_named(harness.state(), "Goals");
+    click_with(&mut harness, goals, Modifiers::NONE);
+    let before = harness.state().view.node_rect(goals).expect("drawn");
+
+    let pixels = vec![eframe::egui::Color32::BLUE; 120 * 80];
+    let image = eframe::egui::ColorImage::new([120, 80], pixels);
+    harness.event(Event::PasteImage(std::sync::Arc::new(image)));
+    harness.run();
+
+    assert!(
+        harness
+            .state()
+            .map
+            .node(goals)
+            .expect("live")
+            .picture()
+            .is_some()
+    );
+    let after = harness.state().view.node_rect(goals).expect("drawn");
+    assert!(
+        after.height() > before.height() + 70.0,
+        "{before:?} -> {after:?}"
+    );
+    assert!(after.width() >= 120.0);
 }

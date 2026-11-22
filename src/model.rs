@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::history::HeapSize;
+use crate::picture::Picture;
 use thiserror::Error;
 
 /// Horizontal distance between a parent and a newly created child.
@@ -62,6 +63,8 @@ pub struct Node {
     note: String,
     /// A web address attached to the node.
     link: Option<String>,
+    /// A picture shown above the label.
+    picture: Option<Picture>,
 }
 
 impl Node {
@@ -76,6 +79,7 @@ impl Node {
             color: None,
             note: String::new(),
             link: None,
+            picture: None,
         }
     }
 }
@@ -177,6 +181,12 @@ impl Node {
     pub fn link(&self) -> Option<&str> {
         self.link.as_deref()
     }
+
+    /// The picture shown above the label, if any.
+    #[must_use]
+    pub const fn picture(&self) -> Option<&Picture> {
+        self.picture.as_ref()
+    }
 }
 
 /// Errors produced by operations on a [`MindMap`].
@@ -214,6 +224,12 @@ pub enum MapError {
     /// There is no such cross-link to remove.
     #[error("these nodes are not linked")]
     LinkNotFound,
+    /// A node record's picture is not a valid PNG or JPEG data URL.
+    #[error("the picture of node {index} is damaged")]
+    InvalidPicture {
+        /// Position of the offending node record.
+        index: usize,
+    },
     /// A link record points at a node that is not in the list, at itself, or repeats
     /// another link.
     #[error("link {index} is invalid: it must join two different, existing nodes once")]
@@ -253,15 +269,21 @@ pub struct NodeRecord {
     /// Attached web address, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// The node's picture as a data URL (`data:image/png;base64,...`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
 }
 
 /// Flat, serializable form of a cross-link: indices into the node records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LinkRecord {
     /// Index of the node record the link starts at.
     pub from: usize,
     /// Index of the node record the link points to.
     pub to: usize,
+    /// Text shown on the link; omitted from the file when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 /// A whole map in flat form: nodes in pre-order, plus cross-links between them.
@@ -274,35 +296,42 @@ pub struct MapRecords {
 }
 
 /// A relationship line between two nodes anywhere in the map, drawn as a dashed arrow
-/// from `from` to `to`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// from `from` to `to`, optionally labelled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CrossLink {
     from: NodeId,
     to: NodeId,
+    label: String,
 }
 
 impl CrossLink {
     /// The node the arrow starts at.
     #[must_use]
-    pub const fn from(self) -> NodeId {
+    pub const fn from(&self) -> NodeId {
         self.from
     }
 
     /// The node the arrow points to.
     #[must_use]
-    pub const fn to(self) -> NodeId {
+    pub const fn to(&self) -> NodeId {
         self.to
+    }
+
+    /// Text shown on the link; empty when it has none.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Whether the link joins `a` and `b`, in either direction.
     #[must_use]
-    pub fn joins(self, a: NodeId, b: NodeId) -> bool {
+    pub fn joins(&self, a: NodeId, b: NodeId) -> bool {
         (self.from, self.to) == (a, b) || (self.from, self.to) == (b, a)
     }
 
     /// Whether the link starts or ends at `id`.
     #[must_use]
-    pub fn touches(self, id: NodeId) -> bool {
+    pub fn touches(&self, id: NodeId) -> bool {
         self.from == id || self.to == id
     }
 }
@@ -319,13 +348,19 @@ impl HeapSize for MindMap {
     fn heap_size(&self) -> usize {
         let slots = self.slots.capacity() * std::mem::size_of::<Option<Node>>()
             + self.free.capacity() * std::mem::size_of::<usize>()
-            + self.links.capacity() * std::mem::size_of::<CrossLink>();
+            + self.links.capacity() * std::mem::size_of::<CrossLink>()
+            + self
+                .links
+                .iter()
+                .map(|link| link.label.capacity())
+                .sum::<usize>();
         let nodes: usize = self
             .iter()
             .map(|(_, node)| {
                 node.text.capacity()
                     + node.note.capacity()
                     + node.link.as_ref().map_or(0, String::capacity)
+                    + node.picture.as_ref().map_or(0, Picture::heap_share)
                     + node.children.capacity() * std::mem::size_of::<NodeId>()
             })
             .sum();
@@ -668,6 +703,16 @@ impl MindMap {
         Ok(())
     }
 
+    /// Show `picture` on a node, or remove its picture with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::NodeNotFound` if `id` does not exist.
+    pub fn set_picture(&mut self, id: NodeId, picture: Option<Picture>) -> Result<(), MapError> {
+        self.node_mut(id)?.picture = picture;
+        Ok(())
+    }
+
     /// Move a node and all of its descendants by the same offset.
     ///
     /// # Arguments
@@ -835,7 +880,32 @@ impl MindMap {
         if self.links.iter().any(|link| link.joins(from, to)) {
             return Err(MapError::DuplicateLink);
         }
-        self.links.push(CrossLink { from, to });
+        self.links.push(CrossLink {
+            from,
+            to,
+            label: String::new(),
+        });
+        Ok(())
+    }
+
+    /// Set the text shown on the link between `a` and `b` (whichever way it points);
+    /// surrounding spaces are trimmed, and an empty label removes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapError::LinkNotFound` if they are not linked.
+    pub fn set_cross_link_label(
+        &mut self,
+        a: NodeId,
+        b: NodeId,
+        label: &str,
+    ) -> Result<(), MapError> {
+        let link = self
+            .links
+            .iter_mut()
+            .find(|link| link.joins(a, b))
+            .ok_or(MapError::LinkNotFound)?;
+        label.trim().clone_into(&mut link.label);
         Ok(())
     }
 
@@ -911,6 +981,7 @@ impl MindMap {
                 color: visit.node.color,
                 note: visit.node.note.clone(),
                 link: visit.node.link.clone(),
+                picture: visit.node.picture.as_ref().map(Picture::to_data_url),
             });
         }
         let links = self
@@ -919,6 +990,7 @@ impl MindMap {
             .map(|link| LinkRecord {
                 from: index_of[link.from.0],
                 to: index_of[link.to.0],
+                label: link.label.clone(),
             })
             .collect();
         MapRecords {
@@ -973,7 +1045,14 @@ impl MindMap {
                     Some(NodeId(parent))
                 }
             };
+            let picture = record
+                .picture
+                .as_deref()
+                .map(Picture::from_data_url)
+                .transpose()
+                .map_err(|_| MapError::InvalidPicture { index })?;
             slots.push(Some(Node {
+                picture,
                 collapsed: record.collapsed,
                 color: record.color,
                 note: record.note,
@@ -990,7 +1069,9 @@ impl MindMap {
         };
         for (index, link) in links.into_iter().enumerate() {
             // Record indices are slot indices here: the map was just built in that order.
-            map.add_cross_link(NodeId(link.from), NodeId(link.to))
+            let (from, to) = (NodeId(link.from), NodeId(link.to));
+            map.add_cross_link(from, to)
+                .and_then(|()| map.set_cross_link_label(from, to, &link.label))
                 .map_err(|_| MapError::InvalidLink { index })?;
         }
         Ok(map)
@@ -1238,9 +1319,12 @@ mod tests {
             map.add_cross_link(a, NodeId(99)),
             Err(MapError::NodeNotFound(NodeId(99)))
         );
-        let link = map.cross_links()[0];
+        let link = &map.cross_links()[0];
         assert_eq!((link.from(), link.to()), (a1, b));
         assert!(link.touches(b) && !link.touches(a));
+        map.set_cross_link_label(b, a1, "  depends on ")
+            .expect("linked");
+        assert_eq!(map.cross_links()[0].label(), "depends on");
 
         // Either direction names the same link.
         map.remove_cross_link(b, a1).expect("linked");
@@ -1266,6 +1350,7 @@ mod tests {
     fn links_survive_records_and_bad_ones_are_rejected() {
         let (mut map, _, b, a1) = sample_map();
         map.add_cross_link(a1, b).expect("valid");
+        map.set_cross_link_label(a1, b, "see also").expect("linked");
 
         let records = map.to_map_records();
         let rebuilt = MindMap::from_map_records(records.clone()).expect("valid");
@@ -1278,13 +1363,36 @@ mod tests {
             (records.links[0].to, records.links[0].from),
         ] {
             let mut bad = records.clone();
-            bad.links.push(LinkRecord { from, to });
+            bad.links.push(LinkRecord {
+                from,
+                to,
+                label: String::new(),
+            });
             assert_eq!(
                 MindMap::from_map_records(bad),
                 Err(MapError::InvalidLink { index: 1 }),
                 "{from} -> {to}"
             );
         }
+    }
+
+    #[test]
+    fn pictures_are_saved_in_records_and_checked_when_read() {
+        let (mut map, a, _, _) = sample_map();
+        let picture = crate::picture::test_picture(30, 20);
+        map.set_picture(a, Some(picture.clone())).expect("a exists");
+
+        let mut records = map.to_map_records();
+        let rebuilt = MindMap::from_map_records(records.clone()).expect("valid");
+        assert_eq!(rebuilt.node(a).and_then(Node::picture), Some(&picture));
+
+        records.nodes[1].picture = Some("data:image/png;base64,AAAA".to_owned());
+        assert_eq!(
+            MindMap::from_map_records(records),
+            Err(MapError::InvalidPicture { index: 1 })
+        );
+        map.set_picture(a, None).expect("a exists");
+        assert_eq!(map.to_records()[1].picture, None);
     }
 
     #[test]

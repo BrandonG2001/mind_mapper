@@ -1,8 +1,24 @@
 //! Cross-links between nodes: starting one (Ctrl+K or the right-click menu), finishing
-//! it with a click on the target, and removing links.
+//! it with a click on the target, labelling and removing links.
+
+use eframe::egui::{self, Key, Modifiers};
 
 use super::{MindMapApp, node_label};
 use crate::model::NodeId;
+
+/// Widest the link label editor gets, in points.
+const LABEL_EDITOR_WIDTH: f32 = 320.0;
+
+/// A link label being edited in a pop-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LabelEdit {
+    /// The link's two ends (in either order).
+    ends: (NodeId, NodeId),
+    /// The text being typed.
+    buffer: String,
+    /// Whether the text field still needs keyboard focus (on the first frame).
+    request_focus: bool,
+}
 
 impl MindMapApp {
     /// Start linking from the selected node: the next click on a node links to it.
@@ -60,6 +76,81 @@ impl MindMapApp {
                 node_label(&self.map, a),
                 node_label(&self.map, b)
             );
+        }
+    }
+
+    /// Open the label editor for the link between `a` and `b`, starting from its label.
+    pub(super) fn edit_link_label(&mut self, a: NodeId, b: NodeId) {
+        let current = self
+            .map
+            .cross_links()
+            .iter()
+            .find(|link| link.joins(a, b))
+            .map(|link| link.label().to_owned());
+        if let Some(buffer) = current {
+            self.label_edit = Some(LabelEdit {
+                ends: (a, b),
+                buffer,
+                request_focus: true,
+            });
+        }
+    }
+
+    /// Draw the link label editor, if open, over the window. Enter or Save keeps the text
+    /// (empty removes the label); Esc, Cancel or a click outside closes it unchanged.
+    pub(super) fn show_label_editor(&mut self, ctx: &egui::Context) {
+        let Some(edit) = &mut self.label_edit else {
+            return;
+        };
+        let (a, b) = edit.ends;
+        let title = format!(
+            "Label for the link between \"{}\" and \"{}\"",
+            node_label(&self.map, a),
+            node_label(&self.map, b)
+        );
+        let response = egui::Modal::new(egui::Id::unique("link_label")).show(ctx, |ui| {
+            ui.set_max_width(LABEL_EDITOR_WIDTH);
+            ui.label(title);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut edit.buffer)
+                    .hint_text("e.g. depends on")
+                    .desired_width(LABEL_EDITOR_WIDTH),
+            );
+            if edit.request_focus {
+                field.request_focus();
+                edit.request_focus = false;
+            }
+            let entered = field.lost_focus()
+                && ui.input(|input| {
+                    input.key_pressed(Key::Enter) && input.modifiers == Modifiers::NONE
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() || entered {
+                    Some(true)
+                } else if ui.button("Cancel").clicked() {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .inner
+        });
+        let save = response
+            .inner
+            .or_else(|| response.should_close().then_some(false));
+        let Some(save) = save else {
+            return;
+        };
+        if let Some(edit) = self.label_edit.take()
+            && save
+        {
+            let (a, b) = edit.ends;
+            if self
+                .edit_map(|map| map.set_cross_link_label(a, b, &edit.buffer))
+                .is_some()
+            {
+                "Link label saved".clone_into(&mut self.status);
+            }
         }
     }
 

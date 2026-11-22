@@ -82,6 +82,8 @@ impl MindMapApp {
 
     pub(super) fn replace_map(&mut self, map: MindMap, path: Option<PathBuf>) {
         self.map = map;
+        // A different map: anything cached by revision (find matches, outline) is stale.
+        self.revision = self.revision.wrapping_add(1);
         self.view.set_focus(None);
         self.linking = None;
         self.history = History::new(HISTORY_LIMITS);
@@ -124,6 +126,7 @@ impl MindMapApp {
             id,
             buffer,
             request_focus: true,
+            in_outline: false,
         });
     }
 

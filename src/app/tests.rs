@@ -1078,3 +1078,38 @@ fn links_start_from_the_selection_and_finish_on_a_click() {
     assert_eq!(app.links_of(b), []);
     assert_eq!(app.links_of(a), [(c, true)]);
 }
+
+#[test]
+fn pictures_are_pasted_or_dropped_onto_nodes() {
+    let dir = TempDir::new("app_pictures");
+    let (mut app, [a, b, _]) = app_with_three_children();
+    let image = eframe::egui::ColorImage::new([8, 6], vec![eframe::egui::Color32::RED; 48]);
+
+    app.select(None);
+    app.paste_picture(&image);
+    assert_eq!(app.status, "Select a node to paste the picture onto");
+
+    app.select(Some(a));
+    app.paste_picture(&image);
+    assert!(app.map.node(a).and_then(Node::picture).is_some());
+    app.perform(Action::Undo);
+    assert!(app.map.node(a).and_then(Node::picture).is_none());
+
+    // A dropped picture file goes to the selected node when dropped on empty canvas;
+    // other files are ignored.
+    let path = dir.path().join("photo.PNG");
+    let bytes = crate::picture::test_picture(4, 4).bytes().to_vec();
+    app.select(Some(b));
+    app.drop_picture(&path, Ok(bytes), None);
+    assert!(app.map.node(b).and_then(Node::picture).is_some());
+    app.drop_picture(&dir.path().join("notes.txt"), Ok(b"hi".to_vec()), None);
+    app.drop_picture(&path, Ok(b"not a png".to_vec()), None);
+    assert!(
+        app.status.starts_with("Could not add the picture"),
+        "{}",
+        app.status
+    );
+
+    app.remove_picture(b);
+    assert!(app.map.node(b).and_then(Node::picture).is_none());
+}

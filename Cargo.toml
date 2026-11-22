@@ -6,11 +6,16 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
+# Pictures on nodes are stored in map files as base64 data URLs.
+base64 = "0.22.1"
 eframe = { version = "0.37.0", features = ["persistence"] }
+# Reading and resizing PNG and JPEG pictures on nodes (eframe already uses it for PNG).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 epaint_default_fonts = "0.37.0"
-resvg = { version = "0.50.0", default-features = false, features = ["text"] }
-# PDF export: vector drawing with the built-in font embedded (no SVG or image support).
-krilla = { version = "0.8.2", default-features = false }
+# PNG export, including pictures on nodes (no system fonts: the built-in font is used).
+resvg = { version = "0.50.0", default-features = false, features = ["text", "raster-images"] }
+# PDF export: vector drawing with the built-in font embedded, plus pictures on nodes.
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images"] }
 rfd = "0.18.0"
 # XML parsing for OPML and FreeMind files (already used by resvg, so no extra download).
 roxmltree = "0.21.2"

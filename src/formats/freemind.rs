@@ -5,7 +5,7 @@
 //! `<richcontent TYPE="NODE">`), its notes in `<richcontent TYPE="NOTE">`, its link in
 //! `LINK`, its colour in `COLOR`, its folded state in `FOLDED`, for branches of the
 //! root its side in `POSITION`, and cross-links as `<arrowlink DESTINATION="..."/>`
-//! naming another node's `ID`.
+//! naming another node's `ID` (with any label in `MIDDLE_LABEL`).
 
 use roxmltree::{Document, Node as XmlNode};
 
@@ -83,8 +83,14 @@ fn read_node(element: XmlNode<'_, '_>) -> NodeFields {
         left: element.attribute("POSITION").map(|side| side == "left"),
         file_id: element.attribute("ID").map(str::to_owned),
         links_to: elements(element, "arrowlink")
-            .filter_map(|arrow| arrow.attribute("DESTINATION"))
-            .map(str::to_owned)
+            .filter_map(|arrow| {
+                let target = arrow.attribute("DESTINATION")?.to_owned();
+                let label = arrow
+                    .attribute("MIDDLE_LABEL")
+                    .unwrap_or_default()
+                    .to_owned();
+                Some((target, label))
+            })
             .collect(),
     }
 }
@@ -175,6 +181,9 @@ impl Dialect for FreeMind {
             push_indent(out, indent);
             out.push_str("<arrowlink");
             push_attribute(out, "DESTINATION", &file_id(link.to()));
+            if !link.label().is_empty() {
+                push_attribute(out, "MIDDLE_LABEL", link.label());
+            }
             out.push_str("/>\n");
         }
     }
@@ -265,7 +274,7 @@ mod tests {
         let map = read(
             r#"<map><node TEXT="root" ID="a">
               <node TEXT="x" ID="b">
-                <arrowlink DESTINATION="c"/>
+                <arrowlink DESTINATION="c" MIDDLE_LABEL="leads to"/>
                 <arrowlink DESTINATION="b"/>
                 <arrowlink DESTINATION="missing"/>
               </node>
@@ -278,14 +287,17 @@ mod tests {
         // The link points forward in the file; a link to itself, one to a missing node
         // and the same link back again are left out.
         assert_eq!(map.cross_links().len(), 1);
-        let link = map.cross_links()[0];
+        let link = &map.cross_links()[0];
         assert_eq!(
             (text_of(&map, link.from()), text_of(&map, link.to())),
             ("x".into(), "y".into())
         );
 
+        assert_eq!(link.label(), "leads to");
+
         let back = read(&write(&map)).expect("own output is valid");
-        let link = back.cross_links()[0];
+        assert_eq!(back.cross_links()[0].label(), "leads to");
+        let link = &back.cross_links()[0];
         assert_eq!(back.cross_links().len(), 1);
         assert_eq!(
             (text_of(&back, link.from()), text_of(&back, link.to())),

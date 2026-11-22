@@ -1,16 +1,21 @@
 //! Drawing a [`MindMap`] through a [`Camera`]. Shared by the editor canvas and the
 //! template thumbnails on the start screen.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui::{
-    Align, Color32, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, Visuals,
-    epaint::CubicBezierShape, text::LayoutJob,
+    Align, Color32, Context, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+    TextureHandle, TextureId, TextureOptions, Vec2, Visuals, epaint::CubicBezierShape,
+    text::LayoutJob,
 };
 
 use crate::camera::Camera;
 use crate::model::{MindMap, Node, NodeColor, NodeId, Point, Visit};
+use crate::picture::Picture;
 
+/// Space between a node's picture and its label, at 100% zoom.
+const PICTURE_GAP: f32 = 6.0;
 /// Font size of node labels at 100% zoom.
 pub const BASE_FONT_SIZE: f32 = 16.0;
 /// Space between a node's label and its border at 100% zoom.
@@ -32,6 +37,10 @@ pub(crate) const LINK_DASH: [f32; 2] = [6.0, 4.0];
 pub(crate) const LINK_OPACITY: f32 = 0.6;
 /// Length of a cross-link's arrowhead at 100% zoom.
 pub(crate) const ARROW_SIZE: f32 = 9.0;
+/// Cross-link labels' font size relative to node labels'.
+pub(crate) const LINK_LABEL_SCALE: f32 = 0.85;
+/// Space between a cross-link label and the edge of its backing, at 100% zoom.
+pub(crate) const LINK_LABEL_PADDING: Vec2 = Vec2::new(6.0, 3.0);
 /// Accent colours cycled through for the root's branches.
 const BRANCH_COLORS: [Color32; 6] = [
     Color32::from_rgb(0x4e, 0x79, 0xa7),
@@ -54,6 +63,64 @@ struct LaidOutNode {
     collapsed: bool,
     /// The node has notes or a link, shown by a folded corner.
     has_details: bool,
+    /// The node's picture on screen: its texture and where it goes.
+    picture: Option<(TextureId, Rect)>,
+}
+
+/// Screen copies of the pictures on the map, by [`Picture::key`], with the frame each was
+/// last needed in. `None` marks a picture that could not be decoded, so it is not retried.
+#[derive(Default)]
+struct PictureTextures {
+    textures: HashMap<u64, (Option<TextureHandle>, u64)>,
+    frame: u64,
+}
+
+// Written by hand: egui's texture handles cannot be printed.
+impl std::fmt::Debug for PictureTextures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PictureTextures")
+            .field("pictures", &self.textures.len())
+            .field("frame", &self.frame)
+            .finish()
+    }
+}
+
+impl PictureTextures {
+    /// Start a frame.
+    fn begin(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// The texture for `picture`, decoding it the first time it is needed.
+    fn texture(&mut self, ctx: &Context, picture: &Picture) -> Option<TextureId> {
+        let frame = self.frame;
+        let (texture, used) = self.textures.entry(picture.key()).or_insert_with(|| {
+            let texture = picture.decode_for_screen().ok().map(|image| {
+                ctx.load_texture(
+                    format!("picture-{:x}", picture.key()),
+                    image,
+                    TextureOptions::LINEAR,
+                )
+            });
+            (texture, frame)
+        });
+        *used = frame;
+        texture.as_ref().map(TextureHandle::id)
+    }
+
+    /// Keep the texture of `picture` (on the map but off screen) for later frames.
+    fn keep(&mut self, picture: &Picture) {
+        if let Some((_, used)) = self.textures.get_mut(&picture.key()) {
+            *used = self.frame;
+        }
+    }
+
+    /// Free the textures of pictures no longer on the map (deleted, folded away).
+    fn end(&mut self) {
+        let frame = self.frame;
+        self.textures.retain(|_, (_, used)| *used == frame);
+    }
 }
 
 /// A camera plus the screen layout of the nodes it drew last.
@@ -69,6 +136,8 @@ pub struct MapView {
     /// Reused every frame: `shown[i]` is whether the node in slot `i` is on the map this
     /// frame (not folded away or outside the focused branch), drawn or scrolled off.
     shown: Vec<bool>,
+    /// Screen copies of the pictures on the map.
+    pictures: PictureTextures,
 }
 
 impl MapView {
@@ -141,6 +210,7 @@ impl MapView {
         self.accents.prime(map, start, text_color);
         self.shown.clear();
         self.shown.resize(map.slot_count(), false);
+        self.pictures.begin();
         let handle_radius = HANDLE_RADIUS * zoom;
         for visit in map.visible_subtree_preorder(start) {
             self.shown[visit.id.index()] = true;
@@ -175,7 +245,19 @@ impl MapView {
                 // Centre each line of a multi-line label, like the editor and exports.
                 job.halign = Align::Center;
                 let galley = painter.layout_job(job);
-                let rect = Rect::from_center_size(center, galley.size() + padding * 2.0);
+                let picture_size = visit
+                    .node
+                    .picture()
+                    .map_or(Vec2::ZERO, |picture| picture.display_size() * zoom);
+                let rect = Rect::from_center_size(
+                    center,
+                    content_size(galley.size(), picture_size, zoom) + padding * 2.0,
+                );
+                let picture = visit.node.picture().and_then(|picture| {
+                    let texture = self.pictures.texture(painter.ctx(), picture)?;
+                    let top = Pos2::new(center.x - picture_size.x * 0.5, rect.min.y + padding.y);
+                    Some((texture, Rect::from_min_size(top, picture_size)))
+                });
                 let collapsed = visit.node.is_collapsed();
                 // Collapsed nodes always show "+"; selected nodes show "-" so they can be
                 // folded with the mouse.
@@ -192,12 +274,33 @@ impl MapView {
                     handle,
                     collapsed,
                     has_details: !visit.node.note().is_empty() || visit.node.link().is_some(),
+                    picture,
                 });
+            } else if let Some(picture) = visit.node.picture() {
+                // Off screen but on the map: keep its screen copy for when it scrolls back.
+                self.pictures.keep(picture);
             }
         }
+        self.pictures.end();
 
-        self.paint_cross_links(painter, map, text_color);
+        self.paint_cross_links(painter, map, visuals);
 
+        self.paint_nodes(painter, visuals, &selected);
+    }
+
+    /// Draw the node boxes laid out by [`MapView::paint`]: border, picture, label, the
+    /// folded corner of nodes with details and the fold handle.
+    fn paint_nodes(
+        &self,
+        painter: &Painter,
+        visuals: &Visuals,
+        selected: &impl Fn(NodeId) -> bool,
+    ) {
+        let zoom = self.camera.zoom();
+        let padding = NODE_PADDING * zoom;
+        let text_color = visuals.strong_text_color();
+        let edge_width = (2.0 * zoom).max(1.0);
+        let handle_radius = HANDLE_RADIUS * zoom;
         let radius = CORNER_RADIUS * zoom;
         let fill = visuals.window_fill();
         let selection = visuals.selection.stroke.color;
@@ -214,10 +317,19 @@ impl MapView {
                 Stroke::new(width, border),
                 StrokeKind::Inside,
             );
-            // A centred galley's lines are laid out around x = 0, so align its own
-            // bounding box (not its origin) with the node's centre.
+            if let Some((texture, place)) = node.picture {
+                let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                painter.image(texture, place, whole, Color32::WHITE);
+            }
+            // The label sits at the bottom of the box (below any picture). A centred
+            // galley's lines are laid out around x = 0, so align its own bounding box (not
+            // its origin) with that spot.
+            let label_center = Pos2::new(
+                node.rect.center().x,
+                node.rect.max.y - padding.y - node.galley.size().y * 0.5,
+            );
             painter.galley(
-                node.rect.center() - node.galley.rect.center().to_vec2(),
+                label_center - node.galley.rect.center().to_vec2(),
                 Arc::clone(&node.galley),
                 text_color,
             );
@@ -242,12 +354,14 @@ impl MapView {
     }
 
     /// Draw the cross-links whose ends are both on the map, under the node boxes.
-    fn paint_cross_links(&self, painter: &Painter, map: &MindMap, color: Color32) {
+    fn paint_cross_links(&self, painter: &Painter, map: &MindMap, visuals: &Visuals) {
         let zoom = self.camera.zoom();
+        let text_color = visuals.strong_text_color();
         let stroke = Stroke::new(
             (LINK_WIDTH * zoom).max(1.0),
-            color.gamma_multiply(LINK_OPACITY),
+            text_color.gamma_multiply(LINK_OPACITY),
         );
+        let label_font = FontId::proportional(BASE_FONT_SIZE * LINK_LABEL_SCALE * zoom);
         let shown = |id: NodeId| self.shown.get(id.index()).copied().unwrap_or(false);
         for link in map.cross_links() {
             let (Some(from), Some(to)) = (map.node(link.from()), map.node(link.to())) else {
@@ -262,6 +376,32 @@ impl MapView {
                 continue;
             }
             paint_cross_link(painter, curve, stroke, zoom);
+            if !link.label().is_empty() {
+                let mut job = LayoutJob::simple(
+                    link.label().to_owned(),
+                    label_font.clone(),
+                    text_color,
+                    MAX_LABEL_WIDTH * zoom,
+                );
+                job.halign = Align::Center;
+                let galley = painter.layout_job(job);
+                let backing = Rect::from_center_size(
+                    curve_midpoint(curve),
+                    galley.size() + LINK_LABEL_PADDING * 2.0 * zoom,
+                );
+                painter.rect(
+                    backing,
+                    CORNER_RADIUS * zoom,
+                    visuals.window_fill(),
+                    stroke,
+                    StrokeKind::Inside,
+                );
+                painter.galley(
+                    backing.center() - galley.rect.center().to_vec2(),
+                    galley,
+                    text_color,
+                );
+            }
         }
     }
 
@@ -396,6 +536,21 @@ pub(crate) fn cross_link_curve(from: Rect, to: Rect) -> [Pos2; 4] {
         second,
         edge_toward(to, second),
     ]
+}
+
+/// The point halfway along a cubic `curve`, where a cross-link's label goes.
+pub(crate) fn curve_midpoint([start, first, second, end]: [Pos2; 4]) -> Pos2 {
+    // The cubic Bezier formula at t = 1/2: weights 1, 3, 3, 1 over 8.
+    let mix = |a: f32, b: f32, c: f32, d: f32| (a + 3.0 * b + 3.0 * c + d) / 8.0;
+    Pos2::new(
+        mix(start.x, first.x, second.x, end.x),
+        mix(start.y, first.y, second.y, end.y),
+    )
+}
+
+/// Estimated size of a cross-link label's backing, like [`estimated_size`] for nodes.
+pub(crate) fn estimated_link_label_size(label: &str) -> Vec2 {
+    (estimated_size(label) - NODE_PADDING * 2.0) * LINK_LABEL_SCALE + LINK_LABEL_PADDING * 2.0
 }
 
 /// Where the line from the centre of `rect` towards `target` leaves the rectangle (or
@@ -577,13 +732,52 @@ pub(crate) fn estimated_size(text: &str) -> Vec2 {
     Vec2::new(text_width, text_height) + NODE_PADDING * 2.0
 }
 
+/// The size of a node's contents: its label of size `label`, with a picture of size
+/// `picture` (zero if none) above it, `zoom` setting the gap between them.
+fn content_size(label: Vec2, picture: Vec2, zoom: f32) -> Vec2 {
+    if picture == Vec2::ZERO {
+        label
+    } else {
+        Vec2::new(
+            label.x.max(picture.x),
+            label.y + picture.y + PICTURE_GAP * zoom,
+        )
+    }
+}
+
+/// Estimated world-space size of `node`'s box: its label (see [`estimated_size`]) and
+/// any picture above it.
+pub(crate) fn estimated_node_size(node: &Node) -> Vec2 {
+    let picture = node.picture().map_or(Vec2::ZERO, Picture::display_size);
+    content_size(
+        estimated_size(node.text()) - NODE_PADDING * 2.0,
+        picture,
+        1.0,
+    ) + NODE_PADDING * 2.0
+}
+
+/// Where a node's picture and label go inside its world-space box `rect`, for exports:
+/// the picture's rectangle (if it has one) and the centre of the label.
+pub(crate) fn node_contents(node: &Node, rect: Rect) -> (Option<Rect>, Pos2) {
+    let label_height = estimated_size(node.text()).y - NODE_PADDING.y * 2.0;
+    let label_center = Pos2::new(
+        rect.center().x,
+        rect.max.y - NODE_PADDING.y - label_height * 0.5,
+    );
+    let picture = node.picture().map(|picture| {
+        let size = picture.display_size();
+        Rect::from_min_size(
+            Pos2::new(rect.center().x - size.x * 0.5, rect.min.y + NODE_PADDING.y),
+            size,
+        )
+    });
+    (picture, label_center)
+}
+
 /// Estimated world-space box of a node.
 pub(crate) fn estimated_rect(node: &Node) -> Rect {
     let position = node.position();
-    Rect::from_center_size(
-        Pos2::new(position.x, position.y),
-        estimated_size(node.text()),
-    )
+    Rect::from_center_size(Pos2::new(position.x, position.y), estimated_node_size(node))
 }
 
 /// World-space rectangle that (approximately) contains every visible node of `start`'s
@@ -715,6 +909,12 @@ mod tests {
         let head = arrow_head(curve, 9.0);
         assert_eq!(head[0], curve[3]);
         assert!((head[1].distance(head[2]) - 9.0).abs() < 1e-3);
+        let middle = curve_midpoint(curve);
+        assert!(
+            middle.x > 50.0 && middle.x < 270.0 && middle.y.abs() > 10.0,
+            "{middle:?}"
+        );
+        assert!(estimated_link_label_size("depends on").x < estimated_size("depends on").x);
         // Boxes in the same place give a dot, not NaNs.
         assert!(
             cross_link_curve(from, from)

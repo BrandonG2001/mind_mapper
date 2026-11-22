@@ -5,8 +5,8 @@
 //! side of the root they are already on, and siblings keep their current top-to-bottom
 //! order, so tidying respects how the user arranged things.
 
-use crate::map_view::estimated_size;
-use crate::model::{MapError, MindMap, NodeId, Point};
+use crate::map_view::{estimated_node_size, estimated_size};
+use crate::model::{MapError, MindMap, Node, NodeId, Point};
 
 /// Horizontal gap between a node's edge and its children's edges, in world units.
 pub(crate) const COLUMN_GAP: f32 = 70.0;
@@ -172,7 +172,7 @@ impl Tidier {
         // Reverse pre-order visits every child before its parent (a post-order).
         for &id in order.iter().rev() {
             let node = map.node(id).ok_or(MapError::NodeNotFound(id))?;
-            let own = own_rows(node.text());
+            let own = own_rows(node);
             self.rows[id.index()] = if node.is_collapsed() || node.children().is_empty() {
                 own
             } else {
@@ -200,7 +200,7 @@ impl Tidier {
         }
         let parent_node = map.node(parent).ok_or(MapError::NodeNotFound(parent))?;
         let parent_pos = parent_node.position();
-        let parent_half_width = estimated_size(parent_node.text()).x * 0.5;
+        let parent_half_width = estimated_node_size(parent_node).x * 0.5;
 
         self.column.clear();
         for &child in children {
@@ -219,7 +219,7 @@ impl Tidier {
             self.direction[child.index()] = dir;
             let height = self.rows[child.index()] * ROW_HEIGHT;
             let child_node = map.node(child).ok_or(MapError::NodeNotFound(child))?;
-            let half_width = estimated_size(child_node.text()).x * 0.5;
+            let half_width = estimated_node_size(child_node).x * 0.5;
             let x = parent_pos.x + dir * (parent_half_width + COLUMN_GAP + half_width);
             map.set_position(child, Point::new(x, top + height * 0.5))?;
             top += height;
@@ -230,10 +230,10 @@ impl Tidier {
 
 /// Rows a node needs for its own box: one for a single-line label, more for a label
 /// that wraps, keeping the same spacing between boxes either way.
-fn own_rows(text: &str) -> f32 {
+fn own_rows(node: &Node) -> f32 {
     let spacing = ROW_HEIGHT - estimated_size("").y;
     // The small epsilon stops float rounding from turning exactly 1.0 into 2 rows.
-    ((estimated_size(text).y + spacing) / ROW_HEIGHT - 1e-3)
+    ((estimated_node_size(node).y + spacing) / ROW_HEIGHT - 1e-3)
         .ceil()
         .max(1.0)
 }
@@ -313,14 +313,22 @@ mod tests {
         let mut map = MindMap::new("root");
         let origin = Point::default();
         let long = "a long label that wraps onto several lines in the canvas ".repeat(2);
-        map.add_child_at(map.root(), &long, origin).expect("root");
-        map.add_child_at(map.root(), "short", Point::new(0.0, 1.0))
+        let long = map.add_child_at(map.root(), &long, origin).expect("root");
+        let short = map
+            .add_child_at(map.root(), "short", Point::new(0.0, 1.0))
             .expect("root");
+        let pictured = map
+            .add_child_at(map.root(), "with a picture", Point::new(0.0, 2.0))
+            .expect("root");
+        map.set_picture(pictured, Some(crate::picture::test_picture(160, 120)))
+            .expect("exists");
 
         tidy(&mut map).expect("consistent map");
 
-        assert!(own_rows(&long) > 1.0);
-        assert!((own_rows("short") - 1.0).abs() < f32::EPSILON);
+        let rows = |id| own_rows(map.node(id).expect("live"));
+        assert!(rows(long) > 1.0);
+        assert!((rows(short) - 1.0).abs() < f32::EPSILON);
+        assert!(rows(pictured) > 2.0, "a picture takes the room it needs");
         assert_no_overlaps(&map);
     }
 

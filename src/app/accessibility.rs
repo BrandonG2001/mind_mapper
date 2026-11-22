@@ -84,13 +84,26 @@ impl MindMapApp {
             .map
             .node(id)
             .map_or_else(String::new, |node| node.note().to_owned());
-        for (other, outgoing) in self.links_of(id) {
+        for link in self
+            .map
+            .cross_links()
+            .iter()
+            .filter(|link| link.touches(id))
+        {
             if !description.is_empty() {
                 description.push('\n');
             }
-            let direction = if outgoing { "Links to" } else { "Linked from" };
+            let (direction, other) = if link.from() == id {
+                ("Links to", link.to())
+            } else {
+                ("Linked from", link.from())
+            };
             write!(description, "{direction} {}", node_label(&self.map, other))
                 .expect("writing into a String cannot fail");
+            if !link.label().is_empty() {
+                write!(description, " ({})", link.label())
+                    .expect("writing into a String cannot fail");
+            }
         }
         description
     }

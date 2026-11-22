@@ -34,7 +34,13 @@ keyboard, drag branches around and save your maps as plain JSON files.
   the map is tidied.
 - **Focus mode**: F6 shows only the selected branch; Esc or F6 brings back the whole map.
 - **Cross-links**: dashed arrows between any two nodes, across branches (Ctrl+K or "Link
-  to..." in the right-click menu, then click the other node). They appear in exports too.
+  to..." in the right-click menu, then click the other node), with an optional label such
+  as "depends on". They appear in exports too.
+- **Outline view** (Ctrl+Shift+O): the map as an indented list beside the canvas. Click a
+  row to select its node, double-click to rename it in place, +/- to fold a branch.
+- **Pictures on nodes**: paste an image (Ctrl+V), drop a PNG or JPEG file onto a node, or
+  choose "Add picture..." in the right-click menu. Pictures are saved inside the map file
+  and appear in PNG, SVG and PDF exports.
 - **Find** any node by its text or notes; matches are highlighted and folded branches open
   as needed.
 - **Cut, copy and paste branches** as bullet outlines: paste a copied branch into a
@@ -115,7 +121,9 @@ mind_mapper path/to/ideas.json
 | Colour, notes, rename, reorder, focus on or delete a node | Right-click it (colour and delete apply to every selected node) |
 | Remove one of your templates | Right-click its card on the start screen |
 | Link two nodes | Right-click the first, choose **Link to...**, then click the second (Esc cancels) |
-| Remove a link | Right-click either node and choose **Remove link to/from ...** |
+| Label or remove a link | Right-click either node and choose **Label link ...** or **Remove link ...** |
+| Add a picture to a node | Drop a PNG or JPEG file onto it, or right-click it and choose **Add picture...** |
+| Select or rename from the outline | Click a row to select its node; double-click to rename it there |
 | Read a node's notes and link | Hover over it |
 | Pan the view | Drag empty space (or right-drag anywhere) |
 | Zoom | Scroll wheel |
@@ -139,7 +147,8 @@ mind_mapper path/to/ideas.json
 | Esc | Cancel a link being made, close the find bar, or leave focus mode |
 | Ctrl+I | Show or hide the side panel with the selected node's colour, notes and link |
 | Ctrl+C / Ctrl+X | Copy / cut the selected branches (or copy the whole map) as an indented outline |
-| Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node |
+| Ctrl+V | Paste an outline (Markdown bullets, numbered items or indented lines) under the selected node, or a copied image onto it |
+| Ctrl+Shift+O | Show or hide the outline view |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 | Ctrl+N | New map (opens the template gallery) |
 | Ctrl+O | Open a map, or import an OPML (`.opml`) or FreeMind (`.mm`) file |
@@ -190,8 +199,10 @@ parent by its position in the list:
 
 Optional fields appear only when used, so files from older versions load unchanged:
 `"collapsed": true` on a folded node, `"color": "#rrggbb"` for a chosen colour, `"note"`
-for notes and `"link"` for a web address. Cross-links are listed after the nodes, by node
-position, as `"links": [{ "from": 6, "to": 1 }]`; versions before 0.9 ignore them.
+for notes, `"link"` for a web address and `"picture"` for a picture, stored as a data URL
+(`"data:image/png;base64,..."`, at most 8 MB). Cross-links are listed after the nodes, by
+node position, as `"links": [{ "from": 6, "to": 1, "label": "depends on" }]`. Versions
+before 0.9 ignore links, and before 0.10 pictures and link labels.
 
 Files are checked when they are opened. A malformed file, or one whose nodes don't form a
 single tree, is rejected with an error message rather than partially loaded.
@@ -261,6 +272,7 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/recent.rs`](src/recent.rs) | The recent-files list |
 | [`src/navigation.rs`](src/navigation.rs) | Arrow-key movement between nodes |
 | [`src/export.rs`](src/export.rs) | PNG, SVG, PDF, Markdown, OPML and FreeMind export |
+| [`src/picture.rs`](src/picture.rs) | Pictures on nodes: reading, storing and scaling them |
 | [`src/update.rs`](src/update.rs) | Asking GitHub for the latest release |
 | [`src/search.rs`](src/search.rs) | The find bar and node matching |
 | [`src/clipboard.rs`](src/clipboard.rs) | Branches to and from clipboard outlines |
@@ -277,7 +289,9 @@ cargo about generate about.hbs -o THIRD_PARTY_NOTICES.txt
 | [`src/app/panels.rs`](src/app/panels.rs) | Toolbar, details panel, find bar, start-screen choices |
 | [`src/app/files.rs`](src/app/files.rs) | Open and import, save (with the overwrite check), export, templates, settings |
 | [`src/app/focus.rs`](src/app/focus.rs) | Focus mode: one branch on its own |
-| [`src/app/links.rs`](src/app/links.rs) | Making and removing cross-links |
+| [`src/app/links.rs`](src/app/links.rs) | Making, labelling and removing cross-links |
+| [`src/app/outline.rs`](src/app/outline.rs) | The outline view |
+| [`src/app/pictures.rs`](src/app/pictures.rs) | Adding pictures by file, paste or drag and drop |
 | [`src/app/questions.rs`](src/app/questions.rs) | In-window questions: discard unsaved work, overwrite |
 | [`src/app/selection.rs`](src/app/selection.rs) | Multi-select, and the edits that act on every selected node |
 | [`src/app/autosave.rs`](src/app/autosave.rs) | Recovery copies and background jobs |

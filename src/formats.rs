@@ -90,8 +90,8 @@ struct NodeFields {
     left: Option<bool>,
     /// The node's identifier in the file, which cross-links refer to.
     file_id: Option<String>,
-    /// Identifiers of the nodes this one has cross-links to.
-    links_to: Vec<String>,
+    /// The cross-links this node starts: the target's identifier and the link's label.
+    links_to: Vec<(String, String)>,
 }
 
 /// The child elements of `parent` named `tag`, in document order.
@@ -117,7 +117,7 @@ fn build_map(
     apply(builder.map_mut(), root_id, root)?;
     // Cross-links can point forward in the file, so they are joined up at the end.
     let mut ids: HashMap<String, NodeId> = HashMap::new();
-    let mut pending: Vec<(NodeId, String)> = Vec::new();
+    let mut pending: Vec<(NodeId, String, String)> = Vec::new();
     remember_links(&mut ids, &mut pending, root_id, root);
     let top: Vec<XmlNode<'_, '_>> = elements(branches, tag).collect();
     // An explicit stack instead of recursion, so deeply nested files cannot overflow the
@@ -138,11 +138,12 @@ fn build_map(
         let children: Vec<XmlNode<'_, '_>> = elements(element, tag).collect();
         stack.extend(children.into_iter().rev().map(|child| (child, id, false)));
     }
-    for (from, target) in pending {
+    for (from, target, label) in pending {
         if let Some(&to) = ids.get(&target) {
             // Links a file repeats or points from a node to itself are left out.
             match builder.map_mut().add_cross_link(from, to) {
-                Ok(()) | Err(MapError::DuplicateLink | MapError::LinkToSelf) => {}
+                Ok(()) => builder.map_mut().set_cross_link_label(from, to, &label)?,
+                Err(MapError::DuplicateLink | MapError::LinkToSelf) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -153,14 +154,19 @@ fn build_map(
 /// Note node `id`'s file identifier, and the cross-links it starts, for [`build_map`].
 fn remember_links(
     ids: &mut HashMap<String, NodeId>,
-    pending: &mut Vec<(NodeId, String)>,
+    pending: &mut Vec<(NodeId, String, String)>,
     id: NodeId,
     fields: &NodeFields,
 ) {
     if let Some(file_id) = &fields.file_id {
         ids.insert(file_id.clone(), id);
     }
-    pending.extend(fields.links_to.iter().map(|target| (id, target.clone())));
+    pending.extend(
+        fields
+            .links_to
+            .iter()
+            .map(|(target, label)| (id, target.clone(), label.clone())),
+    );
 }
 
 /// Give node `id` the details in `fields` (its label is set when it is created).

@@ -100,6 +100,12 @@ impl MindMapApp {
             ),
             ("Find", Action::Find, true, "Ctrl+F"),
             (
+                "Outline",
+                Action::ToggleOutline,
+                true,
+                "Ctrl+Shift+O: the map as an indented list beside the canvas",
+            ),
+            (
                 "Notes",
                 Action::ToggleDetails,
                 true,
@@ -144,7 +150,13 @@ impl MindMapApp {
                 }
             }
         });
-        // Second row: appearance settings, map zoom and the status message.
+        self.toolbar_status_row(ui);
+        clicked
+    }
+
+    /// The toolbar's second row: appearance settings, map zoom, the status message and
+    /// any offered update.
+    fn toolbar_status_row(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             theme_picker(ui, &mut self.theme);
             ui.separator();
@@ -163,7 +175,6 @@ impl MindMapApp {
                 .on_hover_text("Open the release page to download it");
             }
         });
-        clicked
     }
 
     /// Apply side-panel or menu edits to node `id`, as one undo step.

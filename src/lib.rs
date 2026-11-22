@@ -34,6 +34,7 @@ pub mod layout;
 pub mod map_view;
 pub mod model;
 pub mod navigation;
+pub mod picture;
 pub mod recent;
 pub mod recovery;
 pub mod search;
